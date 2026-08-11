@@ -173,6 +173,32 @@ type Config struct {
 	// processed until after the specified timeout.
 	BatchApplyCh bool
 
+	// BatchWindow specifies how long the leader should hold a group-commit
+	// batch open (measured from the first queued entry) before dispatching it,
+	// waiting for more appends to coalesce into the same batch. A single batch
+	// shares one StoreLogs + one replication round, so a non-zero window trades
+	// a bounded increase in commit latency for higher write throughput when the
+	// append rate is low enough that the applyCh would otherwise be dispatched
+	// with a single entry per batch.
+	//
+	// Defaults to 0, which preserves the upstream behavior of dispatching
+	// immediately after a non-blocking gather of whatever is already queued.
+	BatchWindow time.Duration
+
+	// AsyncLeaderPersist enables the leader's own log-store write (including
+	// fsync) to run asynchronously, overlapped with replication to followers
+	// (提前 fsync / Raft thesis §10.2.1). With this enabled, the leader
+	// dispatches entries to replicators immediately after assigning indexes,
+	// and a per-leadership writer goroutine persists them in order. The commit
+	// index is capped at the leader's own durable log, so no entry can be
+	// committed before it is durable on the leader — replicators may pull the
+	// not-yet-durable entries from an in-memory pending buffer.
+	//
+	// Defaults to false, preserving the upstream behavior where the leader's
+	// StoreLogs completes (and the batch is matched locally) before any
+	// replication is triggered.
+	AsyncLeaderPersist bool
+
 	// If we are a member of a cluster, and RemovePeer is invoked for the
 	// local node, then we forget all peers and transition into the follower state.
 	// If ShutdownOnRemove is set, we additional shutdown Raft. Otherwise,

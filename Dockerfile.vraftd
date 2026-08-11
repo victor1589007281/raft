@@ -1,0 +1,24 @@
+# vraftd: the vRaft demo application image.
+#
+# Builds the vraft fork (module github.com/hashicorp/raft) plus its two example
+# commands and packs them into a minimal Alpine runtime. The vraft write-path
+# features (BatchWindow group-commit, async leader persist) are compiled in;
+# they are enabled at runtime via -batch-window / -async-persist.
+#
+# Deps are fetched through goproxy.cn (the host's GOPROXY) because the default
+# proxy.golang.org is unreachable from this network.
+FROM golang:1.26-bookworm AS build
+ENV GOPROXY=https://goproxy.cn,direct \
+    CGO_ENABLED=0
+WORKDIR /src/raft
+COPY go.mod go.sum ./
+COPY . .
+RUN go build -trimpath -o /out/vraftd ./examples/vraftd \
+ && go build -trimpath -o /out/vraft-bench ./examples/vraftd/cmd/driver
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/vraftd /usr/local/bin/vraftd
+COPY --from=build /out/vraft-bench /usr/local/bin/vraft-bench
+EXPOSE 9000 9001
+ENTRYPOINT ["/usr/local/bin/vraftd"]

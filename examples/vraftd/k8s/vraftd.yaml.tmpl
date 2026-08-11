@@ -1,0 +1,106 @@
+# Template for a 3-node vraftd raft cluster in the vraft namespace.
+# Substitute:
+#   __NAME__          -> StatefulSet + headless Service name (e.g. vraft-both)
+#   __BATCH_WINDOW__  -> -batch-window value ("0" disables group-commit)
+#   __ASYNC_PERSIST__ -> "1" enables the vraft async leader persist
+#   __APPEND__        -> raft MaxAppendEntries (kept identical across variants)
+# The headless Service gives each pod the DNS name <set>-<ordinal>.<set>.
+# Pod 0 bootstraps a fresh single-node cluster; pods 1/2 join via HTTP. Every
+# pod persists to a PVC (standard local-path storage class), so raft.log
+# survives pod restarts and local durability can be demonstrated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: __NAME__
+  namespace: vraft
+  labels:
+    app: __NAME__
+spec:
+  clusterIP: None
+  selector:
+    app: __NAME__
+  ports:
+    - name: http
+      port: 9000
+    - name: raft
+      port: 9001
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: __NAME__
+  namespace: vraft
+  labels:
+    app: __NAME__
+spec:
+  serviceName: __NAME__
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: __NAME__
+  template:
+    metadata:
+      labels:
+        app: __NAME__
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: vraftd
+          image: vraftd:vraft
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: BATCH_WINDOW
+              value: "__BATCH_WINDOW__"
+            - name: ASYNC_PERSIST
+              value: "__ASYNC_PERSIST__"
+            - name: MAX_APPEND
+              value: "__APPEND__"
+            - name: SERVICE
+              value: "__NAME__"
+          # The entrypoint computes the vraftd flags from the pod identity. A
+          # fresh pod bootstraps only if it is ordinal 0; all other fresh pods
+          # join through the headless-service DNS names. Restarted pods keep
+          # their on-disk raft.log and skip join entirely.
+          #
+          # The raft advertise address is the pod's stable DNS name
+          # (HOSTNAME.SERVICE, e.g. vraft-both-1.vraft-both). A pod IP would go
+          # stale when the pod is recreated; the DNS name always resolves to the
+          # current pod IP, so peer addresses in the raft configuration survive
+          # pod restarts.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              ARGS="-id $HOSTNAME -http 0.0.0.0:9000 -raft 0.0.0.0:9001 -raft-advertise $HOSTNAME.$SERVICE:9001 -data-dir /data -max-append-entries $MAX_APPEND -snapshot-threshold 1000000"
+              [ "$BATCH_WINDOW" != "0" ] && ARGS="$ARGS -batch-window $BATCH_WINDOW"
+              [ "$ASYNC_PERSIST" = "1" ] && ARGS="$ARGS -async-persist"
+              if [ ! -f /data/logs/raft.log ]; then
+                if [ "$HOSTNAME" = "__NAME__-0" ]; then
+                  ARGS="$ARGS -bootstrap"
+                else
+                  ARGS="$ARGS -join __NAME__-0.__NAME__:9000,__NAME__-1.__NAME__:9000,__NAME__-2.__NAME__:9000"
+                fi
+              fi
+              exec /usr/local/bin/vraftd $ARGS
+          ports:
+            - name: http
+              containerPort: 9000
+            - name: raft
+              containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 1Gi

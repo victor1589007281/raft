@@ -30,7 +30,7 @@ func voters(n int) Configuration {
 // Tests setVoters() keeps matchIndexes where possible.
 func TestCommitment_setVoters(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, makeConfiguration([]string{"a", "b", "c"}), 0)
+	c := newCommitment(commitCh, makeConfiguration([]string{"a", "b", "c"}), 0, "c")
 	c.match("a", 10)
 	c.match("b", 20)
 	c.match("c", 30)
@@ -53,7 +53,7 @@ func TestCommitment_setVoters(t *testing.T) {
 // Tests match() being called with smaller index than before.
 func TestCommitment_match_max(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, voters(5), 4)
+	c := newCommitment(commitCh, voters(5), 4, "s1")
 
 	c.match("s1", 8)
 	c.match("s2", 8)
@@ -68,7 +68,7 @@ func TestCommitment_match_max(t *testing.T) {
 // Tests match() being called with non-voters.
 func TestCommitment_match_nonVoting(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, voters(5), 4)
+	c := newCommitment(commitCh, voters(5), 4, "s1")
 
 	c.match("s1", 8)
 	c.match("s2", 8)
@@ -93,7 +93,7 @@ func TestCommitment_match_nonVoting(t *testing.T) {
 // Tests recalculate() algorithm.
 func TestCommitment_recalculate(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, voters(5), 0)
+	c := newCommitment(commitCh, voters(5), 0, "s1")
 
 	c.match("s1", 30)
 	c.match("s2", 20)
@@ -155,7 +155,7 @@ func TestCommitment_recalculate(t *testing.T) {
 // Tests recalculate() respecting startIndex.
 func TestCommitment_recalculate_startIndex(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, voters(5), 4)
+	c := newCommitment(commitCh, voters(5), 4, "s1")
 
 	c.match("s1", 3)
 	c.match("s2", 3)
@@ -184,7 +184,7 @@ func TestCommitment_recalculate_startIndex(t *testing.T) {
 // to not mark anything committed.
 func TestCommitment_noVoterSanity(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, makeConfiguration([]string{}), 4)
+	c := newCommitment(commitCh, makeConfiguration([]string{}), 4, "s1")
 	c.match("s1", 10)
 	c.setConfiguration(makeConfiguration([]string{}))
 	c.match("s1", 10)
@@ -220,7 +220,7 @@ func TestCommitment_noVoterSanity(t *testing.T) {
 // Single voter commits immediately.
 func TestCommitment_singleVoter(t *testing.T) {
 	commitCh := make(chan struct{}, 1)
-	c := newCommitment(commitCh, voters(1), 4)
+	c := newCommitment(commitCh, voters(1), 4, "s1")
 	c.match("s1", 10)
 	if c.getCommitIndex() != 10 {
 		t.Fatalf("expected 10 entries committed, found %d",

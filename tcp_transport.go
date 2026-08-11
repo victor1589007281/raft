@@ -17,6 +17,26 @@ var (
 	errNotTCP          = errors.New("local address is not a TCP address")
 )
 
+// HostnameAddr is a net.Addr whose String() is a "host:port" pair where host is
+// a DNS name rather than an IP literal. A raft node can advertise a stable name
+// (e.g. a Kubernetes StatefulSet headless-service FQDN such as "vraft-0.vraft")
+// so that peer addresses stored in the raft configuration survive pod
+// re-creation — a pod IP goes stale the moment the pod is rescheduled, and the
+// leader would otherwise never recontact the recreated peer.
+type HostnameAddr struct {
+	network string
+	addr    string
+}
+
+// NewHostnameAddr returns a HostnameAddr for the given "host:port" string.
+func NewHostnameAddr(addr string) *HostnameAddr {
+	return &HostnameAddr{network: "tcp", addr: addr}
+}
+
+func (h *HostnameAddr) Network() string { return h.network }
+
+func (h *HostnameAddr) String() string { return h.addr }
+
 // TCPStreamLayer implements StreamLayer interface for plain TCP.
 type TCPStreamLayer struct {
 	advertise net.Addr
@@ -79,15 +99,23 @@ func newTCPTransport(bindAddr string,
 		listener:  list.(*net.TCPListener),
 	}
 
-	// Verify that we have a usable advertise address
-	addr, ok := stream.Addr().(*net.TCPAddr)
-	if !ok {
+	// Verify that we have a usable advertise address. A concrete IP must be
+	// advertisable (not 0.0.0.0); a HostnameAddr is accepted as-is so raft
+	// stores the stable DNS name in its configuration.
+	switch a := stream.Addr().(type) {
+	case *net.TCPAddr:
+		if a.IP == nil || a.IP.IsUnspecified() {
+			_ = list.Close()
+			return nil, errNotAdvertisable
+		}
+	case *HostnameAddr:
+		if a.String() == "" {
+			_ = list.Close()
+			return nil, errNotAdvertisable
+		}
+	default:
 		_ = list.Close()
 		return nil, errNotTCP
-	}
-	if addr.IP == nil || addr.IP.IsUnspecified() {
-		_ = list.Close()
-		return nil, errNotAdvertisable
 	}
 
 	// Create the network transport

@@ -24,3 +24,6 @@ _testmain.go
 
 # Goland IDE
 .idea
+
+# vraftd demo binary
+/vraftd

@@ -1,0 +1,29 @@
+# Template for a cluster-internal benchmark run against one vraftd cluster.
+# Substitute:
+#   __JOB__     -> unique job name
+#   __TARGETS__ -> comma-separated headless-service HTTP addresses of one cluster
+#   __N__ / __C__ / __SIZE__ -> vraft-bench workload parameters
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB__
+  namespace: vraft
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: driver
+          image: vraftd:vraft
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/vraft-bench"]
+          args:
+            - "-targets"
+            - "__TARGETS__"
+            - "-n"
+            - "__N__"
+            - "-c"
+            - "__C__"
+            - "-size"
+            - "__SIZE__"

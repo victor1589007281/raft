@@ -24,6 +24,10 @@ type commitment struct {
 	// majority of the cluster before this leader may mark anything committed
 	// (per Raft's commitment rule)
 	startIndex uint64
+	// self is the local server ID. With async leader persist, the leader's own
+	// match is the ceiling for the commit index: an entry may only be
+	// committed once it is durable on the leader (see recalculate).
+	self ServerID
 }
 
 // newCommitment returns a commitment struct that notifies the provided
@@ -32,7 +36,9 @@ type commitment struct {
 // 'configuration' is the servers in the cluster.
 // 'startIndex' is the first index created in this term (see
 // its description above).
-func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64) *commitment {
+// 'self' is the local server ID, used to cap the commit index at the leader's
+// own durable log.
+func newCommitment(commitCh chan struct{}, configuration Configuration, startIndex uint64, self ServerID) *commitment {
 	matchIndexes := make(map[ServerID]uint64)
 	for _, server := range configuration.Servers {
 		if server.Suffrage == Voter {
@@ -44,6 +50,7 @@ func newCommitment(commitCh chan struct{}, configuration Configuration, startInd
 		matchIndexes: matchIndexes,
 		commitIndex:  0,
 		startIndex:   startIndex,
+		self:         self,
 	}
 }
 
@@ -96,6 +103,18 @@ func (c *commitment) recalculate() {
 	}
 	sort.Sort(uint64Slice(matched))
 	quorumMatchIndex := matched[(len(matched)-1)/2]
+
+	// vraft (async leader persist): the commit index must never advance past
+	// the leader's own durable log. When the leader persists asynchronously its
+	// own match lags behind followers' matches, so followers alone could
+	// otherwise push the quorum index past what the leader has fsynced — an
+	// entry committed but not durable on the leader would be lost on leader
+	// crash (etcd issue #18). Capping at the leader's match closes this; when
+	// the leader's async fsync completes, match() advances it and re-runs this
+	// recalculation, unblocking the commit.
+	if selfIdx, hasVote := c.matchIndexes[c.self]; hasVote && selfIdx < quorumMatchIndex {
+		quorumMatchIndex = selfIdx
+	}
 
 	if quorumMatchIndex > c.commitIndex && quorumMatchIndex >= c.startIndex {
 		c.commitIndex = quorumMatchIndex

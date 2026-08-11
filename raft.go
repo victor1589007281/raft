@@ -86,6 +86,33 @@ type commitTuple struct {
 	future *logFuture
 }
 
+// asyncWrite is a single leader batch queued for (serial) persistence by the
+// async persist writer goroutine.
+type asyncWrite struct {
+	logs       []*Log
+	futures    []*logFuture
+	lastIndex  uint64
+	term       uint64
+	start      time.Time
+	commitment *commitment // captured at dispatch; only used if still leader of w.term
+}
+
+// asyncStoreErr returns the error that caused the async persist writer to
+// fail, or a generic one if none is recorded.
+func (r *Raft) asyncStoreErr() error {
+	if v := r.asyncWriteErr.Load(); v != nil {
+		if e, ok := v.(error); ok {
+			return e
+		}
+	}
+	return fmt.Errorf("async log store failure")
+}
+
+// asyncStoreErrStore records the error that stopped the async persist writer.
+func (r *Raft) asyncStoreErrStore(err error) {
+	r.asyncWriteErr.Store(err)
+}
+
 // leaderState is state that is used while we are a leader.
 type leaderState struct {
 	leadershipTransferInProgress int32 // indicates that a leadership transfer is in progress.
@@ -96,6 +123,7 @@ type leaderState struct {
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
 }
+
 
 // setLeader is used to modify the current leader Address and ID of the cluster
 func (r *Raft) setLeader(leaderAddr ServerAddress, leaderID ServerID) {
@@ -457,11 +485,25 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
 	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
 		r.configurations.latest,
-		r.getLastIndex()+1 /* first index that may be committed in this term */)
+		r.getLastIndex()+1 /* first index that may be committed in this term */,
+		r.localID)
 	r.leaderState.inflight = list.New()
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
 	r.leaderState.stepDown = make(chan struct{}, 1)
+
+	// Start the per-leadership async persist writer. The writer serially
+	// drains the leader's log batches to the store; replicators are notified
+	// at dispatch time, so their work overlaps the leader's own fsync. A fresh
+	// term resets the failed flag so a transient store failure does not
+	// permanently wedge later leadership terms. The config assertion is guarded
+	// so setupLeaderState remains callable on a config-less Raft (some tests
+	// exercise it directly with a bare struct).
+	if cfg, ok := r.conf.Load().(Config); ok && cfg.AsyncLeaderPersist {
+		r.asyncWriteFailed.Store(false)
+		r.asyncWriteStop = make(chan struct{})
+		r.goFunc(func() { r.runAsyncWriter(r.asyncWriteStop) })
+	}
 }
 
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
@@ -519,6 +561,15 @@ func (r *Raft) runLeader() {
 		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 			e.Value.(*logFuture).respond(ErrLeadershipLost)
 		}
+
+		// Stop the async persist writer and drop its pending buffer: entries
+		// that were dispatched but never made it to disk must not be served by
+		// a future leader under the same index range.
+		if r.asyncWriteStop != nil {
+			close(r.asyncWriteStop)
+			r.asyncWriteStop = nil
+		}
+		r.clearPending()
 
 		// Respond to any pending verify requests
 		for future := range r.leaderState.notify {
@@ -687,6 +738,11 @@ func (r *Raft) leaderLoop() {
 
 		case <-r.leaderState.stepDown:
 			r.mainThreadSaturation.working()
+			r.setState(Follower)
+
+		case <-r.asyncPersistErrCh:
+			r.mainThreadSaturation.working()
+			r.logger.Error("async log persistence failed, stepping down")
 			r.setState(Follower)
 
 		case future := <-r.leadershipTransferCh:
@@ -912,13 +968,39 @@ func (r *Raft) leaderLoop() {
 			}
 			// Group commit, gather all the ready commits
 			ready := []*logFuture{newLog}
-		GROUP_COMMIT_LOOP:
-			for i := 0; i < r.config().MaxAppendEntries; i++ {
+			if w := r.config().BatchWindow; w > 0 {
+				// vraft: time-window group commit. Hold the batch open for at most
+				// BatchWindow (measured from the first queued entry) so that even a
+				// low-concurrency writer can coalesce multiple appends into one batch
+				// and pay one StoreLogs + one replication round per batch. Dispatch
+				// as soon as the batch fills MaxAppendEntries or the window expires.
+				timer := time.NewTimer(w)
+			GROUP_COMMIT_WINDOW:
+				for i := 1; i < r.config().MaxAppendEntries; i++ {
+					select {
+					case newLog := <-r.applyCh:
+						ready = append(ready, newLog)
+					case <-timer.C:
+						break GROUP_COMMIT_WINDOW
+					}
+				}
+				timer.Stop()
+				// Drain a fired timer so the channel is not left readable.
 				select {
-				case newLog := <-r.applyCh:
-					ready = append(ready, newLog)
+				case <-timer.C:
 				default:
-					break GROUP_COMMIT_LOOP
+				}
+			} else {
+				// Default behavior: dispatch after a non-blocking gather of whatever
+				// is already queued (upstream GROUP_COMMIT_LOOP).
+			GROUP_COMMIT_LOOP:
+				for i := 0; i < r.config().MaxAppendEntries; i++ {
+					select {
+					case newLog := <-r.applyCh:
+						ready = append(ready, newLog)
+					default:
+						break GROUP_COMMIT_LOOP
+					}
 				}
 			}
 
@@ -1249,9 +1331,27 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	term := r.getCurrentTerm()
 	lastIndex := r.getLastIndex()
 
+	// vraft async leader persist: with the writer persisting asynchronously, the
+	// durable last index lags behind the dispatched entries still queued in the
+	// pending buffer. Index assignment must account for that pending tail,
+	// otherwise two overlapping batches dispatched before the writer catches up
+	// would be assigned the same index (and the later entries would silently
+	// overwrite the earlier ones on every follower). Without async persist the
+	// pending buffer is always empty and lastIndex is unchanged.
+	if r.config().AsyncLeaderPersist {
+		r.pendingMu.Lock()
+		if len(r.pendingLogs) > 0 {
+			if top := r.pendingBase + uint64(len(r.pendingLogs)) - 1; top > lastIndex {
+				lastIndex = top
+			}
+		}
+		r.pendingMu.Unlock()
+	}
+
 	n := len(applyLogs)
 	logs := make([]*Log, n)
 	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
+	metrics.AddSample([]string{"raft", "leader", "dispatchBatchSize"}, float32(n))
 
 	for idx, applyLog := range applyLogs {
 		applyLog.dispatch = now
@@ -1266,8 +1366,37 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	commitIndex := r.getCommitIndex()
 	r.tryStageCommitIndex(commitIndex)
 
-	// Write the log entry locally
+	if r.config().AsyncLeaderPersist {
+		// vraft async leader persist (12.1.3): notify replicators immediately
+		// and queue the batch for the (serial) async writer, so follower
+		// replication overlaps the leader's own fsync. The writer persists
+		// batches in order; the futures stay on the inflight list and are
+		// responded once they are committed (which can only happen after the
+		// batch is durable on the leader).
+		r.appendPending(logs, lastIndex-uint64(n)+1)
+		for _, f := range r.leaderState.replState {
+			asyncNotifyCh(f.triggerCh)
+		}
+		select {
+		case r.asyncWriteCh <- asyncWrite{
+			logs:       logs,
+			futures:    applyLogs,
+			lastIndex:  lastIndex,
+			term:       term,
+			start:      time.Now(),
+			commitment: r.leaderState.commitment,
+		}:
+		case <-r.shutdownCh:
+		}
+		return
+	}
+
+	// Write the log entry locally. MeasureSince captures the store write + fsync
+	// latency (the log.store latency metric); with a file-backed LogStore this is
+	// the dominant component of a batch's persistence cost.
+	storeStart := time.Now()
 	if err := r.logs.StoreLogs(logs); err != nil {
+		metrics.MeasureSince([]string{"raft", "leader", "logStore", "error"}, storeStart)
 		r.logger.Error("failed to commit logs", "error", err)
 		for _, applyLog := range applyLogs {
 			applyLog.respond(err)
@@ -1275,6 +1404,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		r.setState(Follower)
 		return
 	}
+	metrics.MeasureSince([]string{"raft", "leader", "logStore"}, storeStart)
 	r.leaderState.commitment.match(r.localID, lastIndex)
 
 	// Update the last log since it's on disk now
@@ -1286,7 +1416,178 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	}
 }
 
-// processLogs is used to apply all the committed entries that haven't been
+// appendPending records a dispatched batch in the async-persist pending buffer.
+// Must be called from the main thread (dispatchLogs), in index order.
+func (r *Raft) appendPending(logs []*Log, base uint64) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if len(r.pendingLogs) == 0 {
+		r.pendingBase = base
+	}
+	r.pendingLogs = append(r.pendingLogs, logs...)
+}
+
+// dropPendingThrough removes entries up to and including index from the
+// pending buffer once they have been persisted by the async writer.
+func (r *Raft) dropPendingThrough(index uint64) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if len(r.pendingLogs) == 0 {
+		return
+	}
+	top := r.pendingBase + uint64(len(r.pendingLogs)) - 1
+	if index >= top {
+		r.pendingBase = 0
+		r.pendingLogs = r.pendingLogs[:0]
+		return
+	}
+	if index < r.pendingBase {
+		return
+	}
+	drop := int(index-r.pendingBase) + 1
+	copy(r.pendingLogs, r.pendingLogs[drop:])
+	r.pendingLogs = r.pendingLogs[:len(r.pendingLogs)-drop]
+	r.pendingBase += uint64(drop)
+}
+
+// clearPending drops the whole pending buffer. Called on leadership loss so a
+// future leader never serves stale entries for indexes it re-issues.
+func (r *Raft) clearPending() {
+	r.pendingMu.Lock()
+	r.pendingBase = 0
+	r.pendingLogs = r.pendingLogs[:0]
+	r.pendingMu.Unlock()
+}
+
+// getLog reads a log entry, preferring the async-persist pending buffer (for
+// entries dispatched but not yet durable) and falling back to the durable log
+// store.
+func (r *Raft) getLog(index uint64, log *Log) error {
+	r.pendingMu.Lock()
+	if r.pendingBase > 0 && index >= r.pendingBase {
+		if off := int(index - r.pendingBase); off < len(r.pendingLogs) {
+			*log = *r.pendingLogs[off]
+			r.pendingMu.Unlock()
+			return nil
+		}
+	}
+	r.pendingMu.Unlock()
+	return r.logs.GetLog(index, log)
+}
+
+// getReplicationLastIndex returns the highest index the leader may currently
+// replicate to followers: the durable last log plus the async-persist pending
+// tail (entries already dispatched but not yet fsynced). Without async persist
+// the pending buffer is always empty, so this returns the durable index.
+func (r *Raft) getReplicationLastIndex() uint64 {
+	lastLogIdx, _ := r.getLastLog()
+	if !r.config().AsyncLeaderPersist {
+		return lastLogIdx
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if len(r.pendingLogs) == 0 {
+		return lastLogIdx
+	}
+	top := r.pendingBase + uint64(len(r.pendingLogs)) - 1
+	if top > lastLogIdx {
+		return top
+	}
+	return lastLogIdx
+}
+
+// asyncCoalesceMax is the number of queued asyncWrite batches the writer will
+// coalesce into a single StoreLogs call. Bounded so a sustained producer cannot
+// grow the merged batch without bound (and so the writer keeps returning to the
+// select, where shutdown is observed). Values are balanced against MaxAppendEntries:
+// coalescing up to MaxAppendEntries writes restores the batch accumulation that
+// sync persist gets for free from blocking on the fsync.
+const asyncCoalesceMax = 64
+
+// runAsyncWriter is the per-leadership goroutine that persists dispatched
+// leader batches serially, in dispatch order, so the store and the raft
+// last-log index advance monotonically even while the batches are replicated
+// to followers in parallel.
+func (r *Raft) runAsyncWriter(stopCh chan struct{}) {
+	for {
+		select {
+		case w := <-r.asyncWriteCh:
+			// vraft: coalesce as many queued writes as are immediately available
+			// into one persistence batch. In sync mode the leader loop blocks on
+			// the store fsync, and that stall naturally accumulates entries into
+			// large batches. Async persist removes the stall, so the loop drains
+			// the apply channel fast and dispatches single-entry batches; without
+			// coalescing the writer would pay one fsync round (~10-40ms on
+			// typical storage) per entry. Merging restores one-fsync-per-group.
+			// Writes queued on asyncWriteCh are FIFO and belong to the same
+			// leadership, so merging preserves dispatch order and term.
+		drain:
+			for i := 0; i < asyncCoalesceMax; i++ {
+				select {
+				case more := <-r.asyncWriteCh:
+					w.logs = append(w.logs, more.logs...)
+					w.futures = append(w.futures, more.futures...)
+					if more.lastIndex > w.lastIndex {
+						w.lastIndex = more.lastIndex
+					}
+					if more.start.Before(w.start) {
+						w.start = more.start
+					}
+				case <-stopCh:
+					break drain
+				case <-r.shutdownCh:
+					break drain
+				default:
+					break drain
+				}
+			}
+			r.persistAsyncBatch(w)
+		case <-stopCh:
+			return
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+// persistAsyncBatch persists one leader batch and advances commitment once the
+// batch is durable. See the asyncWrite comment for the safety rules.
+func (r *Raft) persistAsyncBatch(w asyncWrite) {
+	if r.asyncWriteFailed.Load() {
+		for _, f := range w.futures {
+			f.respond(r.asyncStoreErr())
+		}
+		r.dropPendingThrough(w.lastIndex)
+		return
+	}
+	if err := r.logs.StoreLogs(w.logs); err != nil {
+		metrics.MeasureSince([]string{"raft", "leader", "logStore", "error"}, w.start)
+		r.logger.Error("failed to commit logs asynchronously", "error", err)
+		r.asyncWriteFailed.Store(true)
+		r.asyncStoreErrStore(err)
+		for _, f := range w.futures {
+			f.respond(err)
+		}
+		r.dropPendingThrough(w.lastIndex)
+		// Ask the leader loop to step down; we can no longer guarantee
+		// durability of the log.
+		select {
+		case r.asyncPersistErrCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+	metrics.MeasureSince([]string{"raft", "leader", "logStore"}, w.start)
+	metrics.AddSample([]string{"raft", "leader", "asyncPersistBatchSize"}, float32(len(w.logs)))
+	r.setLastLog(w.lastIndex, w.term)
+	r.dropPendingThrough(w.lastIndex)
+	// Count this batch toward commitment only while we are still the leader of
+	// the same term (i.e., this commitment object is current). The commitment's
+	// self-cap keeps the commit index from exceeding this durable last log.
+	if r.getState() == Leader && r.getCurrentTerm() == w.term {
+		w.commitment.match(r.localID, w.lastIndex)
+	}
+}
 // applied up to the given index limit.
 // This can be called from both leaders and followers.
 // Followers call this from AppendEntries, for n entries at a time, and always

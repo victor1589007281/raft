@@ -151,7 +151,7 @@ RPC:
 			}
 			return
 		case deferErr := <-s.triggerDeferErrorCh:
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.replicateTo(s, lastLogIdx)
 			if !shouldStop {
 				deferErr.respond(nil)
@@ -159,7 +159,7 @@ RPC:
 				deferErr.respond(fmt.Errorf("replication failed"))
 			}
 		case <-s.triggerCh:
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.replicateTo(s, lastLogIdx)
 		// This is _not_ our heartbeat mechanism but is to ensure
 		// followers quickly learn the leader's commit index when
@@ -167,7 +167,7 @@ RPC:
 		// can't do this to keep them unblocked by disk IO on the
 		// follower. See https://github.com/hashicorp/raft/issues/282.
 		case <-randomTimeout(r.config().CommitTimeout):
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.replicateTo(s, lastLogIdx)
 		}
 
@@ -248,6 +248,13 @@ START:
 	if resp.Success {
 		// Update our replication state
 		updateLastAppended(s, &req)
+
+		// vraft: per-peer replication gap = leader lastLog − follower lastLog.
+		// High/rising gap means the follower is falling behind (or we should send
+		// a snapshot); used by the adaptive tuning loop (12.6).
+		lastLogIdx, _ := r.getLastLog()
+		labels := []metrics.Label{{Name: "peer_id", Value: string(peer.ID)}}
+		metrics.SetGaugeWithLabels([]string{"raft", "leader", "replicationGap"}, float32(int64(lastLogIdx)-int64(resp.LastLog)), labels)
 
 		// Clear any failures, allow pipelining
 		s.failures = 0
@@ -482,7 +489,7 @@ SEND:
 			}
 			break SEND
 		case deferErr := <-s.triggerDeferErrorCh:
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
 			if !shouldStop {
 				deferErr.respond(nil)
@@ -490,10 +497,10 @@ SEND:
 				deferErr.respond(fmt.Errorf("replication failed"))
 			}
 		case <-s.triggerCh:
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
 		case <-randomTimeout(r.config().CommitTimeout):
-			lastLogIdx, _ := r.getLastLog()
+			lastLogIdx := r.getReplicationLastIndex()
 			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
 		}
 	}
@@ -598,7 +605,10 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRequest, nextIndex uint64) error
 
 	} else {
 		var l Log
-		if err := r.logs.GetLog(nextIndex-1, &l); err != nil {
+		// vraft: read via the pending-aware getLog so a follower whose
+		// nextIndex lands inside the async-persist window still sees the
+		// previous entry.
+		if err := r.getLog(nextIndex-1, &l); err != nil {
 			r.logger.Error("failed to get log", "index", nextIndex-1, "error", err)
 			return err
 		}
@@ -620,7 +630,9 @@ func (r *Raft) setNewLogs(req *AppendEntriesRequest, nextIndex, lastIndex uint64
 	maxIndex := min(nextIndex+uint64(maxAppendEntries)-1, lastIndex)
 	for i := nextIndex; i <= maxIndex; i++ {
 		oldLog := new(Log)
-		if err := r.logs.GetLog(i, oldLog); err != nil {
+		// vraft: pending-aware read so entries already dispatched but not yet
+		// persisted by the async writer can still be replicated immediately.
+		if err := r.getLog(i, oldLog); err != nil {
 			r.logger.Error("failed to get log", "index", i, "error", err)
 			return err
 		}

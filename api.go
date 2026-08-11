@@ -134,6 +134,22 @@ type Raft struct {
 	// leaderState used only while state is leader
 	leaderState leaderState
 
+	// vraft async leader persist (12.1.3): the pending buffer holds entries
+	// dispatched to replicators but not yet persisted by the async writer, so
+	// replicators can fetch them before the leader's own fsync completes.
+	pendingMu   sync.Mutex
+	pendingBase uint64 // log index of pendingLogs[0]; 0 while empty
+	pendingLogs []*Log
+
+	// asyncWriteCh carries leader batches for the (serial) per-leadership
+	// writer; asyncWriteStop terminates the writer on leadership loss;
+	// asyncPersistErrCh asks the leader loop to step down on store failure.
+	asyncWriteCh      chan asyncWrite
+	asyncWriteStop    chan struct{}
+	asyncPersistErrCh chan struct{}
+	asyncWriteFailed  atomic.Bool
+	asyncWriteErr     atomic.Value // error; set when asyncWriteFailed flips true
+
 	// candidateFromLeadershipTransfer is used to indicate that this server became
 	// candidate because the leader tries to transfer leadership. This flag is
 	// used in RequestVoteRequest to express that a leadership transfer is going
@@ -556,6 +572,8 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	r := &Raft{
 		protocolVersion:       protocolVersion,
 		applyCh:               applyCh,
+		asyncWriteCh:          make(chan asyncWrite, 64),
+		asyncPersistErrCh:     make(chan struct{}, 1),
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),

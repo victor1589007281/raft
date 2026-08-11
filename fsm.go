@@ -125,6 +125,12 @@ func (r *Raft) runFSM() {
 	}
 
 	applyBatch := func(reqs []*commitTuple) {
+		// vraft: leader-side dispatch→apply latency. For batches the leader wrote
+		// (futures non-nil), this approximates commit→apply end-to-end; follower
+		// batches carry no dispatch timestamp and are skipped.
+		if len(reqs) > 0 && reqs[0].future != nil && !reqs[0].future.dispatch.IsZero() {
+			metrics.MeasureSince([]string{"raft", "leader", "dispatchToApply"}, reqs[0].future.dispatch)
+		}
 		if !batchingEnabled {
 			for _, ct := range reqs {
 				applySingle(ct)
