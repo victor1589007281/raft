@@ -44,8 +44,12 @@ func (n *Node) httpServer() *http.Server {
 	mux.HandleFunc("/metrics", n.handleMetrics)
 	mux.HandleFunc("/join", n.handleJoin)
 	mux.HandleFunc("/remove", n.handleRemove)
+	mux.HandleFunc("/learner", n.handleLearner)
+	mux.HandleFunc("/promote", n.handlePromote)
+	mux.HandleFunc("/adaptive", n.handleAdaptive)
 	mux.HandleFunc("/kill", n.handleKill)
 	mux.HandleFunc("/bench", n.handleBench)
+	mux.HandleFunc("/bench-read", n.handleBenchRead)
 
 	// Env-gated diagnostics for the async-persist hang investigation.
 	// VRAFTD_DEBUG_NET=1 logs every accepted connection (ConnState) and every
@@ -206,19 +210,65 @@ func (n *Node) handleDel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"index": f.Index()})
 }
 
-// handleRead returns the local (possibly lagging) value for a key.
+// handleRead returns the value for a key under one of the read-consistency
+// tiers (12.2). The tier is selected with ?consistency=strict|lease|stale;
+// "stale" (the historical behavior of a plain local FSM read) is the default so
+// existing clients keep working. strict/lease go through VerifyReadIndex and
+// wait for the FSM to apply at least the returned watermark before reading, so
+// the served value is at least as fresh as the watermark.
 func (n *Node) handleRead(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	if key == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("missing ?key= parameter"))
 		return
 	}
-	val, ok := n.fsm.Get(key)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"key": key, "found": false})
+	var consistency raft.ReadConsistency
+	switch q := r.URL.Query().Get("consistency"); q {
+	case "", "stale":
+		consistency = raft.ReadStale
+	case "lease":
+		consistency = raft.ReadLease
+	case "strict":
+		consistency = raft.ReadStrict
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown consistency %q (want strict|lease|stale)", q))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"key": key, "value": val, "found": true})
+
+	watermark, err := n.raft.VerifyReadIndex(consistency)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	// For strict/lease, stall until the FSM has applied the watermark so the
+	// returned value cannot be older than the consistency tier promised. The
+	// application progress is raft's own applied index (r.AppliedIndex), not the
+	// KVFSM command counter: noop/config entries advance raft's applied index
+	// without ever reaching the FSM, so the counter always lags the log index.
+	if consistency != raft.ReadStale {
+		deadline := time.Now().Add(5 * time.Second)
+		for n.raft.AppliedIndex() < watermark {
+			if time.Now().After(deadline) {
+				writeErr(w, http.StatusGatewayTimeout,
+					fmt.Errorf("raft applied %d still behind watermark %d", n.raft.AppliedIndex(), watermark))
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	val, ok := n.fsm.Get(key)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"key": key, "found": false, "consistency": consistency.String(),
+			"watermark": watermark,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"key": key, "value": val, "found": true,
+		"consistency": consistency.String(), "watermark": watermark,
+	})
 }
 
 // handleReadAll dumps the full replicated map.
@@ -234,6 +284,14 @@ func (n *Node) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, n.raft.Stats())
 }
 
+// configServer is the JSON projection of a raft.Server; the field names are
+// lowercased so the payload matches the rest of the control API.
+type configServer struct {
+	ID       string `json:"id"`
+	Address  string `json:"address"`
+	Suffrage int    `json:"suffrage"`
+}
+
 // handleConfig exposes the latest raft configuration.
 func (n *Node) handleConfig(w http.ResponseWriter, r *http.Request) {
 	f := n.raft.GetConfiguration()
@@ -241,9 +299,18 @@ func (n *Node) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	cfg := f.Configuration()
+	servers := make([]configServer, 0, len(cfg.Servers))
+	for _, s := range cfg.Servers {
+		servers = append(servers, configServer{
+			ID:       string(s.ID),
+			Address:  string(s.Address),
+			Suffrage: int(s.Suffrage),
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"index":   f.Index(),
-		"servers": f.Configuration().Servers,
+		"servers": servers,
 	})
 }
 
@@ -314,6 +381,128 @@ func (n *Node) handleRemove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"removed": req.ID, "index": f.Index()})
 }
 
+// handleLearner adds a node as a non-voting learner (12.5.3). Like /join but
+// for AddLearner: the member receives log entries / snapshots and is excluded
+// from the commit quorum, so scaling out never degrades availability. Promote
+// it with /promote once it has caught up.
+func (n *Node) handleLearner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req struct {
+		ID      string `json:"id"`
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.ID == "" || req.Address == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("id and address are required"))
+		return
+	}
+	f := n.raft.AddLearner(raft.ServerID(req.ID), raft.ServerAddress(req.Address), 0, 10*time.Second)
+	if err := f.Error(); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"learner": true, "id": req.ID, "address": req.Address, "index": f.Index(),
+	})
+}
+
+// handlePromote promotes a learner to a full voter once it has caught up
+// (12.5.3). The handler blocks until the catch-up window (default 60s, or
+// ?timeout=Ns) elapses and the AddVoter entry commits.
+func (n *Node) handlePromote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.ID == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("id is required"))
+		return
+	}
+	timeout := 60 * time.Second
+	if ts := r.URL.Query().Get("timeout"); ts != "" {
+		if d, err := time.ParseDuration(ts); err == nil {
+			timeout = d
+		}
+	}
+	f := n.raft.PromoteToVoter(raft.ServerID(req.ID), timeout)
+	if err := f.Error(); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"promoted": req.ID, "index": f.Index(),
+	})
+}
+
+// handleAdaptive is the runtime adapter for the adaptive-loop knobs (12.6).
+// GET returns the current reloadable configuration (BatchWindow,
+// MaxAppendEntries, ...). POST applies a partial update: only the fields
+// present in the JSON body are changed, and only the vraft batching knobs are
+// validated (heartbeat/election timers are intentionally ignored here — they
+// are reloadable upstream but this control plane is reserved for the write-path
+// adaptive loop).
+func (n *Node) handleAdaptive(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, n.adaptiveState())
+	case http.MethodPost:
+		var req struct {
+			BatchWindowMs    *int `json:"batch_window_ms"`
+			MaxAppendEntries *int `json:"max_append_entries"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		rc := n.raft.ReloadableConfig()
+		if req.BatchWindowMs != nil {
+			if *req.BatchWindowMs < 0 {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("batch_window_ms must be >= 0"))
+				return
+			}
+			rc.BatchWindow = time.Duration(*req.BatchWindowMs) * time.Millisecond
+		}
+		if req.MaxAppendEntries != nil {
+			rc.MaxAppendEntries = *req.MaxAppendEntries
+		}
+		if err := n.raft.ReloadConfig(rc); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, n.adaptiveState())
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("GET or POST required"))
+	}
+}
+
+// adaptiveState snapshots the reloadable config plus the node's batching knobs
+// for reporting by /adaptive.
+func (n *Node) adaptiveState() map[string]any {
+	rc := n.raft.ReloadableConfig()
+	return map[string]any{
+		"batch_window_ms":      rc.BatchWindow.Milliseconds(),
+		"max_append_entries":   rc.MaxAppendEntries,
+		"heartbeat_timeout_ms": rc.HeartbeatTimeout.Milliseconds(),
+		"election_timeout_ms":  rc.ElectionTimeout.Milliseconds(),
+		"trailing_logs":        rc.TrailingLogs,
+		"snapshot_threshold":   rc.SnapshotThreshold,
+		"snapshot_interval_ms": rc.SnapshotInterval.Milliseconds(),
+	}
+}
+
 // handleKill shuts the raft instance down (fault injection for failover tests).
 func (n *Node) handleKill(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -340,6 +529,26 @@ func (n *Node) handleBench(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := runBench(n.raft, n.fsm, req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleBenchRead runs an in-process read-tier benchmark against this node
+// (12.2): POST {"n":..., "c":..., "consistency":"strict|lease|stale"}.
+func (n *Node) handleBenchRead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("POST required"))
+		return
+	}
+	var req readBenchReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	res, err := runReadBench(n.raft, n.fsm, req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

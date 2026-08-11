@@ -1,0 +1,81 @@
+# Standalone learner node for the elasticity (12.5.3) functional test.
+#
+# This is a separate 1-node cluster used as the /learner target: the main
+# cluster's leader AddLearner's it, replicates to it without a vote, then
+# PromoteToVoter's it once it has caught up. It must run with -bootstrap and a
+# stable DNS advertise address (vraft-learner-0.vraft-learner) so the main
+# cluster's replication RPCs can reach it after it is added.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vraft-learner
+  namespace: vraft
+  labels:
+    app: vraft-learner
+spec:
+  clusterIP: None
+  selector:
+    app: vraft-learner
+  ports:
+    - name: http
+      port: 9000
+    - name: raft
+      port: 9001
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vraft-learner
+  namespace: vraft
+  labels:
+    app: vraft-learner
+spec:
+  serviceName: vraft-learner
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: vraft-learner
+  template:
+    metadata:
+      labels:
+        app: vraft-learner
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: vraftd
+          image: vraftd:vraft
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/vraftd"]
+          args:
+            - "-id"
+            - "vraft-learner-0"
+            - "-http"
+            - "0.0.0.0:9000"
+            - "-raft"
+            - "0.0.0.0:9001"
+            - "-raft-advertise"
+            - "vraft-learner-0.vraft-learner:9001"
+            - "-data-dir"
+            - "/data"
+            - "-bootstrap"
+            - "-no-snapshot"
+            - "-max-append-entries"
+            - "1024"
+          ports:
+            - name: http
+              containerPort: 9000
+            - name: raft
+              containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 1Gi

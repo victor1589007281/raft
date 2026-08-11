@@ -134,6 +134,14 @@ type Raft struct {
 	// leaderState used only while state is leader
 	leaderState leaderState
 
+	// vraft lease read (12.2): leaderLeaseExpiry holds the UnixNano deadline of
+	// the current leadership lease. It is refreshed by checkLeaderLease on the
+	// main thread whenever a quorum of voters is still in contact, and reset on
+	// gaining/losing leadership. The read path (leaderLeaseValid) only reads this
+	// atomic value plus thread-safe accessors, so it never touches main-thread-only
+	// state and may be called from any goroutine.
+	leaderLeaseExpiry atomic.Int64
+
 	// vraft async leader persist (12.1.3): the pending buffer holds entries
 	// dispatched to replicators but not yet persisted by the async writer, so
 	// replicators can fetch them before the leader's own fsync completes.
@@ -155,6 +163,12 @@ type Raft struct {
 	// used in RequestVoteRequest to express that a leadership transfer is going
 	// on.
 	candidateFromLeadershipTransfer atomic.Bool
+
+	// vraft (12.4): electionStartedAt records when runCandidate began its
+	// campaign (including the pre-vote phase). runLeader measures the elapsed
+	// election time into the raft.election.elapsed metric and resets it. Main
+	// thread only, no lock needed.
+	electionStartedAt time.Time
 
 	// Stores our local server ID, used to avoid sending RPCs to ourself
 	localID ServerID
@@ -211,6 +225,12 @@ type Raft struct {
 	// configurationsCh is used to get the configuration data safely from
 	// outside of the main thread.
 	configurationsCh chan *configurationsFuture
+
+	// catchupCh is used to poll a learner's catchup state from outside of the
+	// main thread (vraft 12.5 PromoteToVoter). The main thread resolves each
+	// catchupCheckFuture with whether the server's matched index has reached the
+	// leader's last log index.
+	catchupCh chan *catchupCheckFuture
 
 	// bootstrapCh is used to attempt an initial bootstrap from outside of
 	// the main thread.
@@ -593,6 +613,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		trans:                 trans,
 		verifyCh:              make(chan *verifyFuture, 64),
 		configurationsCh:      make(chan *configurationsFuture, 8),
+		catchupCh:             make(chan *catchupCheckFuture, 8),
 		bootstrapCh:           make(chan *bootstrapFuture),
 		observers:             make(map[uint64]*Observer),
 		leadershipTransferCh:  make(chan *leadershipTransferFuture, 1),
@@ -958,6 +979,81 @@ func (r *Raft) VerifyLeader() Future {
 	}
 }
 
+// ReadConsistency selects the consistency tier used by VerifyReadIndex. The
+// tiers trade network round trips against freshness: higher tiers return more
+// recent data but cost more latency. See planning-read 12.2 for the design and
+// the safety argument of the lease tier.
+type ReadConsistency int
+
+const (
+	// ReadStrict performs a quorum round (VerifyLeader) before returning the
+	// commit index. Results are linearizable. This is the default tier and
+	// matches the semantics of calling VerifyLeader + Barrier directly.
+	ReadStrict ReadConsistency = iota
+	// ReadLease serves the read locally while the leader holds a valid lease
+	// (quorum contacted within LeaderLeaseTimeout), returning the commit index
+	// with zero network round trips. If the lease is not valid it falls back to
+	// ReadStrict. Staleness on the lease boundary is bounded by the clock-skew
+	// budget (planning-read 12.2.3).
+	ReadLease
+	// ReadStale reads the local applied watermark without any leadership or
+	// lease check. It may serve arbitrarily stale data — freshness is the
+	// returned applied index — and must only be used where staleness is
+	// acceptable, e.g. read replicas (planning-read 12.2.4).
+	ReadStale
+)
+
+// String returns the stable name of the tier, for diagnostics and the vraftd
+// control plane.
+func (rc ReadConsistency) String() string {
+	switch rc {
+	case ReadStrict:
+		return "strict"
+	case ReadLease:
+		return "lease"
+	case ReadStale:
+		return "stale"
+	default:
+		return fmt.Sprintf("ReadConsistency(%d)", int(rc))
+	}
+}
+
+// VerifyReadIndex is the unified read-path entry point (planning-read 12.2.2).
+// It returns the index watermark up to which the caller's FSM read is safe, or
+// an error when the requested tier cannot be satisfied (e.g. ReadStrict on a
+// non-leader, or a lost leadership during the quorum round). The caller is
+// responsible for ensuring the FSM is applied at least to the returned index
+// before reading (e.g. FSM Barrier) and for actually performing the read.
+func (r *Raft) VerifyReadIndex(consistency ReadConsistency) (uint64, error) {
+	switch consistency {
+	case ReadStale:
+		// Local applied watermark: no leadership or quorum requirement. Works on
+		// any node, including read replicas.
+		return r.getLastApplied(), nil
+
+	case ReadLease:
+		// Fast path: serve locally while the lease is valid. Falls back to the
+		// strict tier when the lease cannot be relied on (not leader, or quorum
+		// contact older than LeaderLeaseTimeout).
+		if r.leaderLeaseValid() {
+			return r.getCommitIndex(), nil
+		}
+		fallthrough
+
+	case ReadStrict:
+		// Quorum round to confirm we are still the leader, then return the
+		// current commit index as the linearizable watermark.
+		metrics.IncrCounter([]string{"raft", "verify_read_index", "strict"}, 1)
+		if err := r.VerifyLeader().Error(); err != nil {
+			return 0, err
+		}
+		return r.getCommitIndex(), nil
+
+	default:
+		return 0, fmt.Errorf("raft: unknown ReadConsistency %d", consistency)
+	}
+}
+
 // GetConfiguration returns the latest configuration. This may not yet be
 // committed. The main loop can access this directly.
 func (r *Raft) GetConfiguration() ConfigurationFuture {
@@ -1038,6 +1134,102 @@ func (r *Raft) AddNonvoter(id ServerID, address ServerAddress, prevIndex uint64,
 		serverAddress: address,
 		prevIndex:     prevIndex,
 	}, timeout)
+}
+
+// AddLearner adds the given server as a learner: a non-voting member that
+// receives log entries (and, if far behind, a snapshot) but neither votes nor
+// participates in commit. It is an alias for AddNonvoter with explicit learner
+// semantics (planning-elasticity 12.5.3): adding a member without a vote never
+// drags the commit quorum, so expansion does not degrade availability. Promote
+// the learner with PromoteToVoter once it has caught up.
+func (r *Raft) AddLearner(id ServerID, address ServerAddress, prevIndex uint64, timeout time.Duration) IndexFuture {
+	return r.AddNonvoter(id, address, prevIndex, timeout)
+}
+
+// PromoteToVoter promotes an existing learner (or any non-voting member) to a
+// full voter (planning-elasticity 12.5.3). It waits until the server has caught
+// up to the leader's log — its confirmed matched index reaches the leader's
+// last log index, checked via the replication state — and then appends an
+// AddVoter configuration entry. The returned future resolves when the
+// configuration change is committed, or fails on timeout / leadership loss /
+// server absent from the configuration. A server that is already a voter
+// resolves immediately with the current commit index.
+func (r *Raft) PromoteToVoter(id ServerID, timeout time.Duration) IndexFuture {
+	// Pre-check membership and suffrage against the thread-safe configuration
+	// snapshot so we fail fast on a bogus id.
+	cfgFuture := r.GetConfiguration()
+	if err := cfgFuture.Error(); err != nil {
+		return errorFuture{err}
+	}
+	cfg := cfgFuture.Configuration()
+	var address ServerAddress
+	found := false
+	for _, s := range cfg.Servers {
+		if s.ID == id {
+			found = true
+			address = s.Address
+			if s.Suffrage == Voter {
+				// Already a full voter: nothing to promote.
+				return &resolvedIndexFuture{index: r.getCommitIndex()}
+			}
+			break
+		}
+	}
+	if !found {
+		return errorFuture{fmt.Errorf("raft: server %s is not in the cluster configuration", id)}
+	}
+
+	fut := &promotionFuture{}
+	fut.ShutdownCh = r.shutdownCh
+	fut.init()
+	r.goFunc(func() {
+		if err := r.waitForLearnerCatchUp(id, timeout); err != nil {
+			fut.respond(err)
+			return
+		}
+		// Learner caught up to the leader: promote it to a voting member.
+		addFuture := r.AddVoter(id, address, 0, 0)
+		if err := addFuture.Error(); err != nil {
+			fut.respond(err)
+			return
+		}
+		fut.index = addFuture.Index()
+		fut.respond(nil)
+	})
+	return fut
+}
+
+// waitForLearnerCatchUp polls the leader's main thread until the learner's
+// confirmed matched index reaches the leader's last log index, the timeout
+// expires, or leadership is lost. Each poll is a single catchupCheckFuture
+// resolved by leaderLoop; polls are spaced a few ms apart so the leader's
+// replication work is not starved.
+func (r *Raft) waitForLearnerCatchUp(id ServerID, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if timeout > 0 && time.Now().After(deadline) {
+			return fmt.Errorf("raft: learner %s did not catch up to the leader within %s", id, timeout)
+		}
+		check := &catchupCheckFuture{serverID: id}
+		check.ShutdownCh = r.shutdownCh
+		check.init()
+		select {
+		case <-r.shutdownCh:
+			return ErrRaftShutdown
+		case r.catchupCh <- check:
+		}
+		if err := check.Error(); err != nil {
+			return err
+		}
+		if check.caughtUp {
+			return nil
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-r.shutdownCh:
+			return ErrRaftShutdown
+		}
+	}
 }
 
 // RemoveServer will remove the given server from the cluster. If the current

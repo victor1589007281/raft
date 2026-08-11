@@ -328,17 +328,40 @@ type ReloadableConfig struct {
 	// ElectionTimeout specifies the time in candidate state without
 	// a leader before we attempt an election.
 	ElectionTimeout time.Duration
+
+	// vraft (12.6): BatchWindow is the time-window of the group-commit loop
+	// (raft.go GROUP_COMMIT_WINDOW). Raising it coalesces more concurrent
+	// appends into each batch; lowering it reduces latency at low concurrency.
+	// Reloadable so an adaptive controller can tune it at runtime.
+	BatchWindow time.Duration
+
+	// vraft (12.6): MaxAppendEntries is the cap on the size of a dispatch batch
+	// and of a single AppendEntries RPC. Reloadable for the same reason as
+	// BatchWindow.
+	MaxAppendEntries int
 }
 
 // apply sets the reloadable fields on the passed Config to the values in
 // `ReloadableConfig`. It returns a copy of Config with the fields from this
 // ReloadableConfig set.
+//
+// Unlike the upstream fields, BatchWindow and MaxAppendEntries are only applied
+// when non-zero: an existing caller of ReloadConfig that predates the adaptive
+// loop (12.6) does not set them, and must keep its current batching behavior
+// rather than silently receive a validation failure from a zeroed
+// MaxAppendEntries.
 func (rc *ReloadableConfig) apply(to Config) Config {
 	to.TrailingLogs = rc.TrailingLogs
 	to.SnapshotInterval = rc.SnapshotInterval
 	to.SnapshotThreshold = rc.SnapshotThreshold
 	to.HeartbeatTimeout = rc.HeartbeatTimeout
 	to.ElectionTimeout = rc.ElectionTimeout
+	if rc.BatchWindow > 0 {
+		to.BatchWindow = rc.BatchWindow
+	}
+	if rc.MaxAppendEntries > 0 {
+		to.MaxAppendEntries = rc.MaxAppendEntries
+	}
 	return to
 }
 
@@ -349,6 +372,8 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.SnapshotThreshold = from.SnapshotThreshold
 	rc.HeartbeatTimeout = from.HeartbeatTimeout
 	rc.ElectionTimeout = from.ElectionTimeout
+	rc.BatchWindow = from.BatchWindow
+	rc.MaxAppendEntries = from.MaxAppendEntries
 }
 
 // DefaultConfig returns a Config with usable defaults.

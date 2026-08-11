@@ -138,6 +138,48 @@ type configurationChangeFuture struct {
 	req configurationChangeRequest
 }
 
+// catchupCheckFuture is a single poll of a learner's catchup state, resolved by
+// the main thread in leaderLoop. It reports whether the server's confirmed
+// matched index has reached the leader's last log index.
+type catchupCheckFuture struct {
+	deferError
+	serverID ServerID
+	caughtUp bool
+}
+
+// promotionFuture is the result of PromoteToVoter: it resolves once the learner
+// has caught up and the AddVoter configuration entry is committed.
+type promotionFuture struct {
+	deferError
+	index uint64
+}
+
+func (p *promotionFuture) Index() uint64 {
+	return p.index
+}
+
+func (p *promotionFuture) Response() interface{} {
+	return nil
+}
+
+// resolvedIndexFuture is a pre-resolved IndexFuture, used by PromoteToVoter to
+// return the current commit index when the server is already a voter.
+type resolvedIndexFuture struct {
+	index uint64
+}
+
+func (r *resolvedIndexFuture) Error() error {
+	return nil
+}
+
+func (r *resolvedIndexFuture) Response() interface{} {
+	return nil
+}
+
+func (r *resolvedIndexFuture) Index() uint64 {
+	return r.index
+}
+
 // bootstrapFuture is used to attempt a live bootstrap of the cluster. See the
 // Raft object's BootstrapCluster member function for more details.
 type bootstrapFuture struct {

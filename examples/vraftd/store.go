@@ -129,6 +129,12 @@ func (s *fileLogStore) reload() error {
 		off += 4 + n
 	}
 	s.endOff = off
+	// Restore the file cursor to EOF. reload() reads with ReadAt (which never
+	// moves the cursor), so without this Seek the next StoreLogs would write at
+	// offset 0 and silently overwrite the head of the log on restart.
+	if _, err := s.f.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -140,6 +146,12 @@ func (s *fileLogStore) StoreLogs(logs []*raft.Log) error {
 	defer s.mu.Unlock()
 	if len(logs) == 0 {
 		return nil
+	}
+	// s.endOff is the authoritative append position; the file cursor must be
+	// parked there. Without this Seek, the first write after a reload would
+	// land at whatever offset the cursor was left at (0 after ReadAt).
+	if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
+		return err
 	}
 	for _, l := range logs {
 		body, err := encodeLog(l)
@@ -241,8 +253,8 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 type fileStableStore struct {
 	mu   sync.Mutex
 	path string
-	term uint64
-	vote []byte
+	Term uint64 `json:"current_term"`
+	Vote []byte `json:"voted_for"`
 }
 
 var _ raft.StableStore = (*fileStableStore)(nil)
@@ -280,10 +292,10 @@ func (s *fileStableStore) Set(key []byte, val []byte) error {
 	switch string(key) {
 	case "CurrentTerm":
 		if len(val) >= 8 {
-			s.term = binary.LittleEndian.Uint64(val)
+			s.Term = binary.LittleEndian.Uint64(val)
 		}
 	case "VotedFor":
-		s.vote = append([]byte(nil), val...)
+		s.Vote = append([]byte(nil), val...)
 	default:
 		return nil
 	}
@@ -296,10 +308,10 @@ func (s *fileStableStore) Get(key []byte) ([]byte, error) {
 	switch string(key) {
 	case "CurrentTerm":
 		buf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(buf, s.term)
+		binary.LittleEndian.PutUint64(buf, s.Term)
 		return buf, nil
 	case "VotedFor":
-		return append([]byte(nil), s.vote...), nil
+		return append([]byte(nil), s.Vote...), nil
 	}
 	return nil, nil
 }

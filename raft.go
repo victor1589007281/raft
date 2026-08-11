@@ -122,8 +122,13 @@ type leaderState struct {
 	replState                    map[ServerID]*followerReplication
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
-}
 
+	// vraft (12.4): the leadership noop is held here instead of being
+	// dispatched immediately, so it can be merged into the first real batch
+	// and save one replication round for the first committed write. It is only
+	// touched by the main thread. nil means no pending noop.
+	pendingNoop *logFuture
+}
 
 // setLeader is used to modify the current leader Address and ID of the cluster
 func (r *Raft) setLeader(leaderAddr ServerAddress, leaderID ServerID) {
@@ -229,6 +234,11 @@ func (r *Raft) runFollower() {
 			c.configurations = r.configurations.Clone()
 			c.respond(nil)
 
+		case cf := <-r.catchupCh:
+			r.mainThreadSaturation.working()
+			// Not the leader, cannot satisfy a catchup poll.
+			cf.respond(ErrNotLeader)
+
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
 			b.respond(r.liveBootstrap(b.configuration))
@@ -315,6 +325,10 @@ func (r *Raft) runCandidate() {
 	term := r.getCurrentTerm() + 1
 	r.logger.Info("entering candidate state", "node", r, "term", term)
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
+
+	// vraft (12.4): timestamp the start of the campaign (pre-vote included).
+	// runLeader measures into raft.election.elapsed once the election is won.
+	r.electionStartedAt = time.Now()
 
 	// Start vote for us, and set a timeout
 	var voteCh <-chan *voteResult
@@ -442,6 +456,11 @@ func (r *Raft) runCandidate() {
 			c.configurations = r.configurations.Clone()
 			c.respond(nil)
 
+		case cf := <-r.catchupCh:
+			r.mainThreadSaturation.working()
+			// Not the leader, cannot satisfy a catchup poll.
+			cf.respond(ErrNotLeader)
+
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
 			b.respond(ErrCantBootstrap)
@@ -485,7 +504,7 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
 	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
 		r.configurations.latest,
-		r.getLastIndex()+1 /* first index that may be committed in this term */,
+		r.getLastIndex()+1, /* first index that may be committed in this term */
 		r.localID)
 	r.leaderState.inflight = list.New()
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
@@ -537,6 +556,11 @@ func (r *Raft) runLeader() {
 	// leaderloop.
 	r.setupLeaderState()
 
+	// The lease is earned by contacting a quorum, never inherited from a prior
+	// leadership. Reset the deadline so stale contact from an earlier term cannot
+	// authorize a lease read.
+	r.leaderLeaseExpiry.Store(0)
+
 	// Run a background go-routine to emit metrics on log age
 	stopCh := make(chan struct{})
 	go emitLogStoreMetrics(r.logs, []string{"raft", "leader"}, oldestLogGaugeInterval, stopCh)
@@ -575,6 +599,14 @@ func (r *Raft) runLeader() {
 		for future := range r.leaderState.notify {
 			future.respond(ErrLeadershipLost)
 		}
+
+		// The lease dies with the leadership: without this reset a lost leader
+		// could keep serving lease reads until the stale deadline passes.
+		r.leaderLeaseExpiry.Store(0)
+
+		// Drop any undispased leadership noop: it was never assigned a log
+		// index, so a future leadership starts clean.
+		r.leaderState.pendingNoop = nil
 
 		// Clear all the state
 		r.leaderState.commitCh = nil
@@ -620,8 +652,19 @@ func (r *Raft) runLeader() {
 	// an unbounded number of uncommitted configurations in the log. We now
 	// maintain that there exists at most one uncommitted configuration entry in
 	// any log, so we have to do proper no-ops here.
-	noop := &logFuture{log: Log{Type: LogNoop}}
-	r.dispatchLogs([]*logFuture{noop})
+	//
+	// vraft (12.4): the noop is held in leaderState.pendingNoop and merged into
+	// the first real batch (leaderLoop) instead of being dispatched on its own,
+	// saving one replication round for the first committed write. A fallback
+	// timer flushes it alone if no client log arrives promptly, so the term
+	// commit is still established in idle clusters.
+	r.leaderState.pendingNoop = &logFuture{log: Log{Type: LogNoop}}
+
+	// Measure the elapsed time of the winning election (set by runCandidate).
+	if !r.electionStartedAt.IsZero() {
+		metrics.MeasureSince([]string{"raft", "election", "elapsed"}, r.electionStartedAt)
+		r.electionStartedAt = time.Time{}
+	}
 
 	// Sit in the leader loop until we step down
 	r.leaderLoop()
@@ -728,6 +771,23 @@ func (r *Raft) leaderLoop() {
 	// based on the current config value.
 	lease := time.After(r.config().LeaderLeaseTimeout)
 
+	// vraft (12.4): the leadership noop is merged into the first real batch to
+	// save one replication round. If no client log arrives within half the
+	// election timeout, flush the noop alone so the term commit is still
+	// established promptly in idle clusters. flushNoopCh is per-leadership, so a
+	// stale timer from a previous leadership cannot touch the new one.
+	flushNoopCh := make(chan struct{}, 1)
+	var flushNoopTimer *time.Timer
+	if r.leaderState.pendingNoop != nil {
+		flushTimeout := r.config().ElectionTimeout / 2
+		flushNoopTimer = time.AfterFunc(flushTimeout, func() {
+			select {
+			case flushNoopCh <- struct{}{}:
+			default:
+			}
+		})
+	}
+
 	for r.getState() == Leader {
 		r.mainThreadSaturation.sleeping()
 
@@ -744,6 +804,35 @@ func (r *Raft) leaderLoop() {
 			r.mainThreadSaturation.working()
 			r.logger.Error("async log persistence failed, stepping down")
 			r.setState(Follower)
+
+		case <-flushNoopCh:
+			r.mainThreadSaturation.working()
+			// Fallback timer fired before any real batch arrived: dispatch the
+			// leadership noop on its own.
+			if noop := r.leaderState.pendingNoop; noop != nil {
+				r.leaderState.pendingNoop = nil
+				if stepDown {
+					noop.respond(ErrNotLeader)
+				} else {
+					r.dispatchLogs([]*logFuture{noop})
+				}
+			}
+
+		case cf := <-r.catchupCh:
+			r.mainThreadSaturation.working()
+			// Learner catchup poll (vraft 12.5): report whether the server's
+			// confirmed matched index has reached the leader's last log index.
+			if r.getState() != Leader {
+				cf.respond(ErrNotLeader)
+				continue
+			}
+			repl, ok := r.leaderState.replState[cf.serverID]
+			if !ok {
+				cf.respond(fmt.Errorf("raft: no replication state for server %s", cf.serverID))
+				continue
+			}
+			cf.caughtUp = atomic.LoadUint64(&repl.matched) >= r.getLastIndex()
+			cf.respond(nil)
 
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
@@ -968,6 +1057,16 @@ func (r *Raft) leaderLoop() {
 			}
 			// Group commit, gather all the ready commits
 			ready := []*logFuture{newLog}
+			// vraft (12.4): merge the pending leadership noop into this first
+			// real batch, saving one replication round for the first committed
+			// write of the term.
+			if noop := r.leaderState.pendingNoop; noop != nil {
+				r.leaderState.pendingNoop = nil
+				if flushNoopTimer != nil {
+					flushNoopTimer.Stop()
+				}
+				ready = append([]*logFuture{noop}, ready...)
+			}
 			if w := r.config().BatchWindow; w > 0 {
 				// vraft: time-window group commit. Hold the batch open for at most
 				// BatchWindow (measured from the first queued entry) so that even a
@@ -1155,12 +1254,35 @@ func (r *Raft) checkLeaderLease() time.Duration {
 
 	// Verify we can contact a quorum
 	quorum := r.quorumSize()
-	if contacted < quorum {
+	if contacted >= quorum {
+		// Renew the lease: the most recent quorum contact happened maxDiff ago,
+		// so the deadline is now - maxDiff + LeaderLeaseTimeout. Publishing this
+		// atomically lets the lease-read path (leaderLeaseValid) decide validity
+		// from any goroutine without touching main-thread state.
+		expiry := now.Add(leaseTimeout - maxDiff)
+		r.leaderLeaseExpiry.Store(expiry.UnixNano())
+	} else {
 		r.logger.Warn("failed to contact quorum of nodes, stepping down")
 		r.setState(Follower)
 		metrics.IncrCounter([]string{"raft", "transition", "leader_lease_timeout"}, 1)
 	}
 	return maxDiff
+}
+
+// leaderLeaseValid reports whether this node currently holds a valid leadership
+// lease: it is the leader AND the main thread has confirmed contact with a
+// quorum of voters within LeaderLeaseTimeout. Unlike checkLeaderLease it never
+// steps down and may be called from any goroutine — it reads only the atomic
+// lease deadline published by checkLeaderLease plus thread-safe accessors, and
+// derives the quorum size from the snapshot of the latest configuration rather
+// than the main-thread copy. A zero deadline (leader not yet contacted a quorum,
+// or not the leader) reports invalid.
+func (r *Raft) leaderLeaseValid() bool {
+	if r.State() != Leader {
+		return false
+	}
+	deadline := r.leaderLeaseExpiry.Load()
+	return deadline != 0 && time.Now().UnixNano() < deadline
 }
 
 // quorumSize is used to return the quorum size. This must only be called on
@@ -1588,6 +1710,7 @@ func (r *Raft) persistAsyncBatch(w asyncWrite) {
 		w.commitment.match(r.localID, w.lastIndex)
 	}
 }
+
 // applied up to the given index limit.
 // This can be called from both leaders and followers.
 // Followers call this from AppendEntries, for n entries at a time, and always

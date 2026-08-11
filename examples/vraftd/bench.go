@@ -116,6 +116,128 @@ func runBench(r *raft.Raft, fsm *KVFSM, req benchReq) (*benchResult, error) {
 	return res, nil
 }
 
+// readBenchReq describes an in-process read-load run: total reads, client
+// concurrency and the consistency tier (strict|lease|stale).
+type readBenchReq struct {
+	Ops         int    `json:"n"`
+	Clients     int    `json:"c"`
+	Consistency string `json:"consistency"`
+}
+
+// readBenchResult reports throughput and the latency distribution of a single
+// read tier. Latency units match the write bench (nanoseconds); the driver
+// converts to ms for display.
+type readBenchResult struct {
+	Consistency string  `json:"consistency"`
+	Ops         int     `json:"ops"`
+	Failed      int     `json:"failed"`
+	DurationNs  int64   `json:"duration_ns"`
+	Throughput  float64 `json:"throughput_ops_s"`
+	P50Ns       int64   `json:"p50_ns"`
+	P90Ns       int64   `json:"p90_ns"`
+	P99Ns       int64   `json:"p99_ns"`
+	MaxNs       int64   `json:"max_ns"`
+	MinNs       int64   `json:"min_ns"`
+}
+
+// runReadBench measures one read tier (12.2) in-process: C client goroutines
+// each call VerifyReadIndex(tier) and then read a fixed key from the FSM. This
+// is the same access pattern as /read?consistency=..., so strict pays a quorum
+// round per read while lease/stale are local and only differ in the
+// leadership/lease check. The tier must be satisfiable by this node: strict and
+// lease require the leader (lease falls back to strict when not held).
+func runReadBench(r *raft.Raft, fsm *KVFSM, req readBenchReq) (*readBenchResult, error) {
+	if req.Ops <= 0 {
+		return nil, errors.New("n (total ops) must be positive")
+	}
+	if req.Clients <= 0 {
+		return nil, errors.New("c (clients) must be positive")
+	}
+	var tier raft.ReadConsistency
+	switch req.Consistency {
+	case "", "strict":
+		tier = raft.ReadStrict
+	case "lease":
+		tier = raft.ReadLease
+	case "stale":
+		tier = raft.ReadStale
+	default:
+		return nil, fmt.Errorf("unknown consistency %q (want strict|lease|stale)", req.Consistency)
+	}
+
+	// Seed a key through raft and wait until the FSM has applied it, so every
+	// read below finds a value.
+	seedKey := fmt.Sprintf("bench-read-%d", time.Now().UnixNano())
+	cmd, _ := json.Marshal(kvCmd{Op: "set", K: seedKey, V: strings.Repeat("x", 64)})
+	seedFut := r.Apply(cmd, 10*time.Second)
+	if err := seedFut.Error(); err != nil {
+		return nil, fmt.Errorf("seed apply: %w", err)
+	}
+	// Wait for raft to apply the seed entry (raft applied index, not the FSM
+	// command counter — see handleRead for why the two diverge).
+	deadline := time.Now().Add(10 * time.Second)
+	for r.AppliedIndex() < seedFut.Index() {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("fsm never applied seed at index %d", seedFut.Index())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var (
+		mu     sync.Mutex
+		lat    []time.Duration
+		failed int64
+		wg     sync.WaitGroup
+		remain int32
+	)
+	remain = int32(req.Ops)
+	start := time.Now()
+	for c := 0; c < req.Clients; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if atomic.AddInt32(&remain, -1) < 0 {
+					return
+				}
+				t0 := time.Now()
+				_, err := r.VerifyReadIndex(tier)
+				if err == nil {
+					if _, ok := fsm.Get(seedKey); !ok {
+						err = fmt.Errorf("seeded value missing from FSM")
+					}
+				}
+				d := time.Since(t0)
+				if err != nil {
+					atomic.AddInt64(&failed, 1)
+				}
+				mu.Lock()
+				lat = append(lat, d)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	res := &readBenchResult{
+		Consistency: tier.String(),
+		Ops:         req.Ops,
+		Failed:      int(atomic.LoadInt64(&failed)),
+		DurationNs:  elapsed.Nanoseconds(),
+		Throughput:  float64(req.Ops) / elapsed.Seconds(),
+	}
+	if len(lat) > 0 {
+		sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+		res.P50Ns = percentile(lat, 50).Nanoseconds()
+		res.P90Ns = percentile(lat, 90).Nanoseconds()
+		res.P99Ns = percentile(lat, 99).Nanoseconds()
+		res.MaxNs = lat[len(lat)-1].Nanoseconds()
+		res.MinNs = lat[0].Nanoseconds()
+	}
+	return res, nil
+}
+
 func percentile(sorted []time.Duration, p float64) time.Duration {
 	idx := int(float64(len(sorted)) * p / 100)
 	if idx >= len(sorted) {

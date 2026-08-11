@@ -43,6 +43,13 @@ type followerReplication struct {
 	// which may fall past the end of the log.
 	nextIndex uint64
 
+	// matched is the highest log index confirmed stored by the follower (vraft
+	// 12.5). Unlike nextIndex it only advances on real acks, so it is a reliable
+	// catchup indicator for learner promotion (matched >= leader lastIndex ⇒ the
+	// learner holds every committed entry). Initialized to 0 and updated on
+	// successful AppendEntries and InstallSnapshot.
+	matched uint64
+
 	// peer contains the network address and ID of the remote follower.
 	peer Server
 	// peerLock protects 'peer'
@@ -375,6 +382,7 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 	if resp.Success {
 		// Update the indexes
 		atomic.StoreUint64(&s.nextIndex, meta.Index+1)
+		atomic.StoreUint64(&s.matched, meta.Index)
 		s.commitment.match(peer.ID, meta.Index)
 
 		// Clear any failures
@@ -669,6 +677,7 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
 	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
 		atomic.StoreUint64(&s.nextIndex, last.Index+1)
+		atomic.StoreUint64(&s.matched, last.Index)
 		s.commitment.match(s.peer.ID, last.Index)
 	}
 
