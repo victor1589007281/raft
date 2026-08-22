@@ -199,6 +199,45 @@ type Config struct {
 	// replication is triggered.
 	AsyncLeaderPersist bool
 
+	// ---- vraft 12.7: redo 单写化 / 12.8: RPC 传输 / 12.9: 内核 I/O ----
+	// All flags below default to false/zero (disabled) for compatibility.
+	// Each new capability is behind a switch, per project requirement.
+
+	// 12.7 — Single WAL & FSM async persist
+	// SingleWALEnabled enables the unified WAL prototype: raft log file is
+	// also the redo-visible segment file; FSM materialization degrades to
+	// in-memory watermark advancement. Requires a compatible LogStore
+	// (examples/vraftd unifiedWALStore).
+	SingleWALEnabled bool
+	// SingleWALSparseIndex enables the LSN→(index,offset) sparse index
+	// on top of SingleWAL (requires SingleWALEnabled).
+	SingleWALSparseIndex bool
+	// FsmAsyncPersist makes BatchingFSM.ApplyBatch pure bookkeeping
+	// (AnchorBase / contiguous frontier) without a file Sync on the
+	// critical path. Control commands remain ordered.
+	FsmAsyncPersist bool
+
+	// 12.8 — RPC transport (NetworkTransport)
+	RPCRawBytesEnabled bool
+	RPCWritevEnabled   bool
+	RPCZeroCopyEnabled bool
+	RPCBusyPollEnabled bool
+	RPCIORingEnabled   bool
+	// RPCProtocolLevel: 1 = single TCP + raw + writev + sendfile baseline,
+	// 2 = dual-channel split, 3 = QUIC, 4 = RDMA (reserved).
+	RPCProtocolLevel int
+	RPCTCPConfig     RPCTCPConfig
+
+	// 12.9 — Kernel I/O (disk / file path)
+	UseFdatasync        bool
+	PreallocateSegments bool
+	SegmentSize         int64
+	IORingEnabled       bool
+	IORingSQPoll        bool
+	UseSyncFileRange    bool
+	UseFadvise          bool
+	DirectIOEnabled     bool
+
 	// If we are a member of a cluster, and RemovePeer is invoked for the
 	// local node, then we forget all peers and transition into the follower state.
 	// If ShutdownOnRemove is set, we additional shutdown Raft. Otherwise,
@@ -298,6 +337,15 @@ func (conf *Config) getOrCreateLogger() hclog.Logger {
 	})
 }
 
+// RPCTCPConfig groups 12.8 TCP tuning knobs (all optional, probed).
+type RPCTCPConfig struct {
+	TCPNoDelay  *bool `json:"tcp_no_delay,omitempty"`
+	KeepAlive   *bool `json:"keep_alive,omitempty"`
+	SndBuf      *int  `json:"snd_buf,omitempty"`
+	UserTimeout *int  `json:"user_timeout_ms,omitempty"` // milliseconds
+	BBR         *bool `json:"bbr,omitempty"`
+}
+
 // ReloadableConfig is the subset of Config that may be reconfigured during
 // runtime using raft.ReloadConfig. We choose to duplicate fields over embedding
 // or accepting a Config but only using specific fields to keep the API clear.
@@ -339,6 +387,11 @@ type ReloadableConfig struct {
 	// and of a single AppendEntries RPC. Reloadable for the same reason as
 	// BatchWindow.
 	MaxAppendEntries int
+
+	// vraft (12.9): low-risk disk knobs safe to hot-reload.
+	UseFdatasync        *bool `json:"use_fdatasync,omitempty"`
+	PreallocateSegments *bool `json:"preallocate_segments,omitempty"`
+	UseFadvise          *bool `json:"use_fadvise,omitempty"`
 }
 
 // apply sets the reloadable fields on the passed Config to the values in
@@ -362,6 +415,15 @@ func (rc *ReloadableConfig) apply(to Config) Config {
 	if rc.MaxAppendEntries > 0 {
 		to.MaxAppendEntries = rc.MaxAppendEntries
 	}
+	if rc.UseFdatasync != nil {
+		to.UseFdatasync = *rc.UseFdatasync
+	}
+	if rc.PreallocateSegments != nil {
+		to.PreallocateSegments = *rc.PreallocateSegments
+	}
+	if rc.UseFadvise != nil {
+		to.UseFadvise = *rc.UseFadvise
+	}
 	return to
 }
 
@@ -374,6 +436,12 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.ElectionTimeout = from.ElectionTimeout
 	rc.BatchWindow = from.BatchWindow
 	rc.MaxAppendEntries = from.MaxAppendEntries
+	v := from.UseFdatasync
+	rc.UseFdatasync = &v
+	v2 := from.PreallocateSegments
+	rc.PreallocateSegments = &v2
+	v3 := from.UseFadvise
+	rc.UseFadvise = &v3
 }
 
 // DefaultConfig returns a Config with usable defaults.
@@ -435,6 +503,18 @@ func ValidateConfig(config *Config) error {
 	}
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
+	}
+	if config.SingleWALSparseIndex && !config.SingleWALEnabled {
+		return fmt.Errorf("SingleWALSparseIndex requires SingleWALEnabled")
+	}
+	if config.IORingSQPoll && !config.IORingEnabled {
+		return fmt.Errorf("IORingSQPoll requires IORingEnabled")
+	}
+	if config.RPCProtocolLevel < 0 || config.RPCProtocolLevel > 4 {
+		return fmt.Errorf("RPCProtocolLevel must be 0..4 (0=auto/off, 1=baseline, 2=dual-channel, 3=QUIC, 4=RDMA)")
+	}
+	if config.SegmentSize < 0 {
+		return fmt.Errorf("SegmentSize must be >= 0")
 	}
 	return nil
 }

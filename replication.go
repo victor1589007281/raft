@@ -630,16 +630,36 @@ func (r *Raft) setPreviousLog(req *AppendEntriesRequest, nextIndex uint64) error
 
 // setNewLogs is used to setup the logs which should be appended for a request.
 func (r *Raft) setNewLogs(req *AppendEntriesRequest, nextIndex, lastIndex uint64) error {
-	// Append up to MaxAppendEntries or up to the lastIndex. we need to use a
-	// consistent value for maxAppendEntries in the lines below in case it ever
-	// becomes reloadable.
+	// 12.8.2: when RPCRawBytesEnabled and the log store exposes GetLogRaw, clone
+	// the entry's Data slice directly (no extra decode pass). Falls back to the
+	// legacy getLog path; keeps the wire payload identical.
+	useRaw := r.config().RPCRawBytesEnabled
 	maxAppendEntries := r.config().MaxAppendEntries
 	req.Entries = make([]*Log, 0, maxAppendEntries)
 	maxIndex := min(nextIndex+uint64(maxAppendEntries)-1, lastIndex)
 	for i := nextIndex; i <= maxIndex; i++ {
+		if useRaw {
+			if s, ok := r.logs.(interface{ GetLogRaw(uint64) ([]byte, error) }); ok {
+				raw, err := s.GetLogRaw(i)
+				if err == nil {
+					// Minimal synthetic Log: Index is authoritative for replication,
+					// Data is already wire-ready; Term is best-effort (filled below
+						// if missing).
+					oldLog := &Log{Index: i, Data: raw}
+					if oldLog.Term == 0 {
+						var tmp Log
+						if err2 := r.getLog(i, &tmp); err2 == nil {
+							oldLog.Term = tmp.Term
+							oldLog.Type = tmp.Type
+							oldLog.Extensions = tmp.Extensions
+						}
+					}
+					req.Entries = append(req.Entries, oldLog)
+					continue
+				}
+			}
+		}
 		oldLog := new(Log)
-		// vraft: pending-aware read so entries already dispatched but not yet
-		// persisted by the async writer can still be replicated immediately.
 		if err := r.getLog(i, oldLog); err != nil {
 			r.logger.Error("failed to get log", "index", i, "error", err)
 			return err

@@ -46,6 +46,27 @@ func main() {
 		joinAddrs   = flag.String("join", "", "comma-separated HTTP addresses of cluster members to join")
 		batchWin    = flag.Duration("batch-window", 0, "vraft: leader group-commit window (0 disables; e.g. 2ms)")
 		asyncPers   = flag.Bool("async-persist", false, "vraft: leader persists asynchronously, overlapping its fsync with replication")
+		useFdatasync = flag.Bool("use-fdatasync", false, "12.9: use fdatasync instead of fsync (skip inode mtime flush)")
+		preallocSeg = flag.Bool("preallocate-segments", false, "12.9: preallocate next segment via fallocate")
+		segSize     = flag.Int64("segment-size", 0, "12.9: segment size for preallocation (0=64MiB)")
+		useFadvise  = flag.Bool("use-fadvise", false, "12.9: fadvise DONTNEED on truncated tail")
+		useSFR      = flag.Bool("use-sync-file-range", false, "12.9: sync_file_range async writeback kick")
+	ioring     = flag.Bool("ioring", false, "12.9: io_uring chain WRITE->FSYNC (probed, fallback to O_DSYNC)")
+	ioringSQPoll = flag.Bool("ioring-sqpoll", false, "12.9: io_uring SQPOLL (requires -ioring)")
+	directIO   = flag.Bool("direct-io", false, "12.9: O_DIRECT+IOPOLL tier (档位化，默认关)")
+	singleWAL  = flag.Bool("single-wal", false, "12.7: unified WAL prototype (raft log == redo segment)")
+	sparseIdx  = flag.Bool("sparse-index", false, "12.7: LSN->(index,off) sparse index (requires -single-wal)")
+	fsmAsync   = flag.Bool("fsm-async-persist", false, "12.7: BatchingFSM.ApplyBatch pure bookkeeping (no Sync)")
+	rpcRaw     = flag.Bool("rpc-raw-bytes", false, "12.8.2: raw-bytes GetLogRaw fast path")
+	rpcWritev  = flag.Bool("rpc-writev", false, "12.8.3: writev/net.Buffers fan-out")
+	rpcZCopy   = flag.Bool("rpc-zerocopy", false, "12.8.5: sendfile/splice zero-copy snapshot path")
+	rpcBusyPoll = flag.Bool("rpc-busy-poll", false, "12.8.6: SO_BUSY_POLL on accepted conns")
+	rpcIORing  = flag.Bool("rpc-ioring", false, "12.8.7: io_uring network probe")
+	rpcLevel   = flag.Int("rpc-protocol-level", 0, "12.8.8: protocol tier 0=auto/off 1=baseline 2=dual 3=QUIC 4=RDMA (reserved)")
+	tcpNoDelay = flag.Bool("tcp-nodelay", true, "12.8.4: TCP_NODELAY (default on)")
+	tcpSndBuf  = flag.Int("tcp-sndbuf", 0, "12.8.4: SO_SNDBUF bytes (0=kernel default)")
+	tcpUserTimeout = flag.Int("tcp-user-timeout", 0, "12.8.4: TCP_USER_TIMEOUT ms (0=off)")
+	tcpBBR     = flag.Bool("tcp-bbr", false, "12.8.4: TCP_CONGESTION=bbr")
 		snapThresh  = flag.Uint64("snapshot-threshold", 8192, "logs outstanding before a snapshot is triggered")
 		noSnap      = flag.Bool("no-snapshot", false, "disable periodic snapshots (clean benchmark runs)")
 		maxAppend   = flag.Int("max-append-entries", 64, "max AppendEntries in a single batch")
@@ -85,6 +106,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("open log store: %v", err)
 	}
+	logStore.useFdatasync = *useFdatasync
+	logStore.preallocateSegments = *preallocSeg
+	logStore.segmentSize = *segSize
+	logStore.useFadvise = *useFadvise
+	logStore.useSyncFileRange = *useSFR
+	logStore.ioringEnabled = *ioring
+	logStore.ioringSQPoll = *ioringSQPoll
+	logStore.directIOEnabled = *directIO
+	logStore.singleWALEnabled = *singleWAL
+	logStore.singleWALSparseIndex = *sparseIdx
 	stableStore, err := newFileStableStore(filepath.Join(*dataDir, "stable"))
 	if err != nil {
 		log.Fatalf("open stable store: %v", err)
@@ -92,11 +123,6 @@ func main() {
 	snapStore, err := raft.NewFileSnapshotStore(filepath.Join(*dataDir, "snapshots"), 2, os.Stderr)
 	if err != nil {
 		log.Fatalf("open snapshot store: %v", err)
-	}
-
-	trans, err := raft.NewTCPTransport(*raftAddr, adv, 4, 10*time.Second, os.Stderr)
-	if err != nil {
-		log.Fatalf("open raft transport: %v", err)
 	}
 
 	fsm := newKVFSM()
@@ -123,8 +149,38 @@ func main() {
 	// vraft write-path features.
 	conf.BatchWindow = *batchWin
 	conf.AsyncLeaderPersist = *asyncPers
+	conf.UseFdatasync = *useFdatasync
+	conf.PreallocateSegments = *preallocSeg
+	conf.SegmentSize = *segSize
+	conf.UseFadvise = *useFadvise
+	conf.UseSyncFileRange = *useSFR
+	conf.IORingEnabled = *ioring
+	conf.IORingSQPoll = *ioringSQPoll
+	conf.DirectIOEnabled = *directIO
+	conf.SingleWALEnabled = *singleWAL
+	conf.SingleWALSparseIndex = *sparseIdx
+	conf.FsmAsyncPersist = *fsmAsync
+	conf.RPCRawBytesEnabled = *rpcRaw
+	conf.RPCWritevEnabled = *rpcWritev
+	conf.RPCZeroCopyEnabled = *rpcZCopy
+	conf.RPCBusyPollEnabled = *rpcBusyPoll
+	conf.RPCIORingEnabled = *rpcIORing
+	conf.RPCProtocolLevel = *rpcLevel
+	if *tcpNoDelay { v:=true; conf.RPCTCPConfig.TCPNoDelay=&v } else { v:=false; conf.RPCTCPConfig.TCPNoDelay=&v }
+	if *tcpSndBuf>0 { v:=*tcpSndBuf; conf.RPCTCPConfig.SndBuf=&v }
+	if *tcpUserTimeout>0 { v:=*tcpUserTimeout; conf.RPCTCPConfig.UserTimeout=&v }
+	if *tcpBBR { v:=true; conf.RPCTCPConfig.BBR=&v }
 
-	// A fresh node either bootstraps itself (first member) or joins an existing
+	var trans raft.Transport
+	needNTC := *rpcRaw || *rpcWritev || *rpcZCopy || *rpcBusyPoll || *rpcIORing || *rpcLevel!=0 || *tcpSndBuf>0 || *tcpUserTimeout>0 || *tcpBBR
+	if needNTC {
+		ntc := &raft.NetworkTransportConfig{ MaxPool: 4, Timeout: 10*time.Second, RPCRawBytesEnabled: *rpcRaw, RPCWritevEnabled: *rpcWritev, RPCZeroCopyEnabled: *rpcZCopy, RPCBusyPollEnabled: *rpcBusyPoll, RPCIORingEnabled: *rpcIORing, RPCProtocolLevel: *rpcLevel, RPCTCPConfig: raft.TransportRPCTCPConfig{ TCPNoDelay: conf.RPCTCPConfig.TCPNoDelay, KeepAlive: conf.RPCTCPConfig.KeepAlive, SndBuf: conf.RPCTCPConfig.SndBuf, UserTimeout: conf.RPCTCPConfig.UserTimeout, BBR: conf.RPCTCPConfig.BBR } }
+		if tr, err2 := raft.NewTCPTransportWithConfig(*raftAddr, adv, ntc); err2 != nil { log.Fatalf("open raft transport: %v", err2) } else { trans = tr }
+	} else {
+		if tr, err2 := raft.NewTCPTransport(*raftAddr, adv, 4, 10*time.Second, os.Stderr); err2 != nil { log.Fatalf("open raft transport: %v", err2) } else { trans = tr }
+	}
+
+		// A fresh node either bootstraps itself (first member) or joins an existing
 	// cluster. A node with on-disk data just restarts and recovers its role.
 	if !hadData {
 		switch {

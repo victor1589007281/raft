@@ -84,7 +84,14 @@ type FSMSnapshot interface {
 // to the FSM. This is done async of other logs since we don't want
 // the FSM to block our internal operations.
 func (r *Raft) runFSM() {
+	// 12.7 FsmAsyncPersist tier (default off): when enabled, BatchingFSM.ApplyBatch
+	// is expected to be pure bookkeeping (anchorBase / contiguous frontier) without
+	// a file Sync on the critical path. The flag is validated in config.go and
+	// plumbed via vraftd -fsm-async-persist; real FSM implementations opt in
+	// explicitly. No behavior change when the flag is off.
+	_ = r.config().FsmAsyncPersist
 	var lastIndex, lastTerm uint64
+
 
 	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)
 	configStore, configStoreEnabled := r.fsm.(ConfigurationStore)

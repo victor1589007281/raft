@@ -59,6 +59,20 @@ func (c *LogCache) GetLog(idx uint64, log *Log) error {
 	return c.store.GetLog(idx, log)
 }
 
+// GetLogRaw is the 12.8.2 raw-bytes fast path: if the backing store exposes
+// GetLogRaw (e.g. InmemStore / future unified WAL), return the wire bytes
+// without an extra decode/copy. Falls back to GetLog when unavailable.
+func (c *LogCache) GetLogRaw(idx uint64) ([]byte, error) {
+	if s, ok := c.store.(interface{ GetLogRaw(uint64) ([]byte, error) }); ok {
+		return s.GetLogRaw(idx)
+	}
+	var l Log
+	if err := c.GetLog(idx, &l); err != nil {
+		return nil, err
+	}
+	return l.Data, nil
+}
+
 func (c *LogCache) StoreLog(log *Log) error {
 	return c.StoreLogs([]*Log{log})
 }

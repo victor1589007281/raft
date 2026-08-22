@@ -20,6 +20,7 @@ import (
 
 	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/raft"
+	"golang.org/x/sys/unix"
 )
 
 var msgpackHandle codec.MsgpackHandle
@@ -47,6 +48,21 @@ type fileLogStore struct {
 	logs    []*raft.Log
 	offsets []int64 // file offset of logs[i] (points at the record's len field)
 	endOff  int64   // current end-of-file offset
+
+	// 12.9 — optional kernel I/O knobs (all default off; probed with fallback).
+	useFdatasync        bool
+	preallocateSegments bool
+	segmentSize         int64 // 0 = default 64 MiB
+	useFadvise          bool
+	useSyncFileRange    bool
+	// 12.9/12.7 higher tiers — wired behind switches, probed with fallback.
+	// DirectIO: reserved tier (requires aligned buffers + O_DIRECT fd); probed in store_ioring.go.
+	// SingleWAL + sparse index: unified WAL segment prototype (raft log == redo); gated here, store_ioring.go hosts the index.
+	ioringEnabled         bool
+	ioringSQPoll          bool
+	directIOEnabled       bool
+	singleWALEnabled      bool
+	singleWALSparseIndex  bool
 }
 
 var _ raft.LogStore = (*fileLogStore)(nil)
@@ -141,6 +157,12 @@ func (s *fileLogStore) reload() error {
 // StoreLogs appends a batch and fsyncs. This is the hot path for the write
 // throughput benchmark: the Sync is exactly what the vraft BatchWindow and
 // async leader persist overlap with replication.
+//
+// 12.9 knobs (all behind switches, probed with fallback):
+//   - UseFdatasync: Sync → Fdatasync (skip inode mtime flush).
+//   - PreallocateSegments: fallocate next segment eagerly.
+//   - UseSyncFileRange: kick async writeback mid-batch (SYNC_FILE_RANGE_WRITE).
+//   - UseFadvise: DONTNEED truncated tail for page-cache hygiene.
 func (s *fileLogStore) StoreLogs(logs []*raft.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -174,7 +196,36 @@ func (s *fileLogStore) StoreLogs(logs []*raft.Log) error {
 		s.endOff += 4 + int64(len(body))
 	}
 	// Durability barrier: the entries are not durable until this returns.
-	return s.f.Sync()
+	// 12.9 tiers (probed): io_uring chain → fdatasync → fsync.
+	if s.ioringEnabled {
+		if err := storeLogsIORing(s.f, s.endOff, s.ioringSQPoll); err == nil {
+			// io_uring chain succeeded
+		} else if s.useFdatasync {
+			if err2 := fdatasync(s.f); err2 != nil { return err2 }
+		} else {
+			if err2 := s.f.Sync(); err2 != nil { return err2 }
+		}
+	} else if s.directIOEnabled {
+		// O_DIRECT+IOPOLL tier: reserved档位, currently falls back to barrier above via sync_file_range hint;
+		// real path needs aligned buffers + O_DIRECT fd. Keep flag wired; barrier below is the correctness anchor.
+		_ = syncFileRange(s.f, 0, 0)
+		if s.useFdatasync {
+			if err := fdatasync(s.f); err != nil { return err }
+		} else {
+			if err := s.f.Sync(); err != nil { return err }
+		}
+	} else if s.useFdatasync {
+		if err := fdatasync(s.f); err != nil { return err }
+	} else {
+		if err := s.f.Sync(); err != nil { return err }
+	}
+	if s.preallocateSegments {
+		_ = preallocate(s.f, s.endOff, s.segmentSize)
+	}
+	if s.useSyncFileRange {
+		_ = syncFileRange(s.f, 0, 0) // best-effort async writeback kick
+	}
+	return nil
 }
 
 func (s *fileLogStore) StoreLog(l *raft.Log) error {
@@ -212,6 +263,8 @@ func (s *fileLogStore) LastIndex() (uint64, error) {
 
 // DeleteRange truncates the log at the first deleted index. Everything at or
 // above `min` is removed both from memory and from the file.
+// DeleteRange truncates at the first deleted index; with SingleWAL sparse index enabled the
+// caller-owned sparse LSN→(index,off) index would be pruned here (prototype placeholder).
 func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,17 +288,57 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	if len(s.logs) == 0 {
 		s.first = 0
 	}
+	oldEnd := s.endOff
 	if err := s.f.Truncate(truncAt); err != nil {
 		return err
 	}
 	if _, err := s.f.Seek(truncAt, io.SeekStart); err != nil {
 		return err
 	}
-	if err := s.f.Sync(); err != nil {
-		return err
+	if s.useFdatasync {
+		if err := fdatasync(s.f); err != nil {
+			return err
+		}
+	} else {
+		if err := s.f.Sync(); err != nil {
+			return err
+		}
+	}
+	if s.useFadvise && oldEnd > truncAt {
+		_ = fadviseDontNeed(s.f, truncAt, oldEnd-truncAt)
 	}
 	s.endOff = truncAt
 	return nil
+}
+
+// ---- 12.9 helpers (probed with fallback; all best-effort) ----
+
+func fdatasync(f *os.File) error {
+	if err := unix.Fdatasync(int(f.Fd())); err != nil {
+		return f.Sync()
+	}
+	return nil
+}
+
+func preallocate(f *os.File, off, segSize int64) error {
+	sz := segSize
+	if sz <= 0 {
+		sz = 64 << 20
+	}
+	target := ((off / sz) + 1) * sz
+	n := target - off
+	if n <= 0 {
+		return nil
+	}
+	return unix.Fallocate(int(f.Fd()), 0, off, n)
+}
+
+func syncFileRange(f *os.File, off, n int64) error {
+	return unix.SyncFileRange(int(f.Fd()), off, n, unix.SYNC_FILE_RANGE_WRITE)
+}
+
+func fadviseDontNeed(f *os.File, off, n int64) error {
+	return unix.Fadvise(int(f.Fd()), off, n, unix.FADV_DONTNEED)
 }
 
 // ---------------------------------------------------------------------------
