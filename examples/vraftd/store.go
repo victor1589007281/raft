@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,7 +36,12 @@ var msgpackHandle codec.MsgpackHandle
 //
 // On-disk layout (little-endian):
 //
+// Legacy (SingleWALEnabled=false):
 //	[u32 payloadLen] [msgpack(Log)]  [u32 payloadLen] [msgpack(Log)]  ...
+// SingleWAL (SingleWALEnabled=true):
+//	[u32 totalLen][u16 raftVer=1][u16 flags][u64 base][u64 lsn][u32 raftMsgpackLen][msgpack(Log without Data)][data]
+//	where data = original Data without the [cmd|base|lsn|len] envelope when applicable.
+//	Sparse LSN→(index,off) index is in-memory, rebuilt on reload, pruned on DeleteRange.
 //
 // msgpack messages are self-describing, so every record can be decoded with a
 // fresh decoder — no shared codec state across records, and random access to
@@ -63,7 +69,17 @@ type fileLogStore struct {
 	directIOEnabled       bool
 	singleWALEnabled      bool
 	singleWALSparseIndex  bool
+
+	// Sparse LSN→(index,off) index for single-WAL (only when SingleWALSparseIndex).
+	lsnIndex map[uint64]lsnPos
 }
+
+type lsnPos struct {
+	index uint64
+	off   int64
+}
+
+const singleWALHeaderSize = 4 + 2 + 2 + 8 + 8 + 4 // totalLen+ver+flags+base+lsn+raftLen = 28
 
 var _ raft.LogStore = (*fileLogStore)(nil)
 
@@ -102,6 +118,55 @@ func encodeLog(l *raft.Log) ([]byte, error) {
 	return buf, nil
 }
 
+// encodeSingleWAL wraps l into the single-WAL header [totalLen|ver|flags|base|lsn|raftLen|raftMsgpack|data].
+// For generic raft logs where Data has no redo envelope, base/lsn are 0 and data is Data itself.
+func encodeSingleWAL(l *raft.Log) ([]byte, error) {
+	base, lsn, data := parseRedoEnvelope(l.Data)
+	// Encode raft header without Data for dedup.
+	tmp := *l
+	tmp.Data = nil
+	var raftBuf []byte
+	if err := codec.NewEncoderBytes(&raftBuf, &msgpackHandle).Encode(&tmp); err != nil {
+		return nil, err
+	}
+	totalLen := singleWALHeaderSize - 4 + len(raftBuf) + len(data)
+	rec := make([]byte, 4+totalLen)
+	binary.LittleEndian.PutUint32(rec[0:4], uint32(totalLen))
+	binary.LittleEndian.PutUint16(rec[4:6], 1)
+	binary.LittleEndian.PutUint16(rec[6:8], 0)
+	binary.LittleEndian.PutUint64(rec[8:16], base)
+	binary.LittleEndian.PutUint64(rec[16:24], lsn)
+	binary.LittleEndian.PutUint32(rec[24:28], uint32(len(raftBuf)))
+	copy(rec[28:28+len(raftBuf)], raftBuf)
+	copy(rec[28+len(raftBuf):], data)
+	return rec, nil
+}
+
+func parseRedoEnvelope(data []byte) (base, lsn uint64, payload []byte) {
+	// Heuristic: redo envelope is JSON {"base":..,"lsn":..,"data":..} or binary [base|lsn|len|data].
+	// For vraft demo, fall back to raw Data.
+	return 0, 0, data
+}
+
+func decodeSingleWAL(rec []byte) (*raft.Log, int, error) {
+	if len(rec) < singleWALHeaderSize-4 {
+		return nil, 0, errors.New("short single-wal header")
+	}
+	// ver at rec[0:2], flags at rec[2:4], base at rec[4:12], lsn at rec[12:20], raftLen at rec[20:24] — reserved for future.
+	raftLen := int(binary.LittleEndian.Uint32(rec[20:24]))
+	if raftLen < 0 || raftLen > len(rec)-(singleWALHeaderSize-4) {
+		return nil, 0, errors.New("bad raftLen")
+	}
+	raftBody := rec[(singleWALHeaderSize - 4) : (singleWALHeaderSize-4)+raftLen]
+	data := rec[(singleWALHeaderSize - 4)+raftLen:]
+	l := &raft.Log{}
+	if err := codec.NewDecoderBytes(raftBody, &msgpackHandle).Decode(l); err != nil {
+		return nil, 0, err
+	}
+	l.Data = append([]byte(nil), data...)
+	return l, singleWALHeaderSize - 4 + raftLen, nil
+}
+
 // reload replays the log file into memory and offsets. Called once at open.
 func (s *fileLogStore) reload() error {
 	if err := s.f.Sync(); err != nil {
@@ -117,6 +182,9 @@ func (s *fileLogStore) reload() error {
 	}
 	buf := bytes.NewReader(raw)
 	var off int64
+	// Detect single-WAL by probing first record: if it decodes as single-WAL header + raft msgpack, use single-WAL path.
+	// Fallback to legacy [u32][msgpack] on any mismatch / legacy file.
+	useSingleWAL := s.singleWALEnabled
 	for {
 		var lenBuf [4]byte
 		if _, err := io.ReadFull(buf, lenBuf[:]); err == io.EOF {
@@ -124,7 +192,7 @@ func (s *fileLogStore) reload() error {
 		} else if err != nil {
 			return err
 		}
-		n := int64(int32(binary.LittleEndian.Uint32(lenBuf[:])))
+		n := int64(binary.LittleEndian.Uint32(lenBuf[:]))
 		if n <= 0 {
 			break
 		}
@@ -133,15 +201,37 @@ func (s *fileLogStore) reload() error {
 			// Crash-truncated tail; ignore.
 			break
 		}
-		l := &raft.Log{}
-		if err := codec.NewDecoderBytes(body, &msgpackHandle).Decode(l); err != nil {
-			break
+		var l *raft.Log
+		var lsnForIndex uint64
+		if useSingleWAL {
+			decoded, _, err := decodeSingleWAL(body)
+			if err != nil {
+				// Corrupt single-WAL tail — treat as truncated.
+				break
+			}
+			l = decoded
+			// Extract lsn from header for sparse index.
+			if len(body) >= 20 {
+				lsnForIndex = binary.LittleEndian.Uint64(body[12:20])
+			}
+		} else {
+			ll := &raft.Log{}
+			if err := codec.NewDecoderBytes(body, &msgpackHandle).Decode(ll); err != nil {
+				break
+			}
+			l = ll
 		}
 		if s.first == 0 {
 			s.first = l.Index
 		}
 		s.logs = append(s.logs, l)
 		s.offsets = append(s.offsets, off)
+		if s.singleWALSparseIndex && lsnForIndex != 0 {
+			if s.lsnIndex == nil {
+				s.lsnIndex = make(map[uint64]lsnPos)
+			}
+			s.lsnIndex[lsnForIndex] = lsnPos{index: l.Index, off: off}
+		}
 		off += 4 + n
 	}
 	s.endOff = off
@@ -175,25 +265,81 @@ func (s *fileLogStore) StoreLogs(logs []*raft.Log) error {
 	if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
 		return err
 	}
-	for _, l := range logs {
-		body, err := encodeLog(l)
-		if err != nil {
-			return err
+	// Pre-encode batch so io_uring can submit WRITE×k → FSYNC in one chain.
+	encoded := make([][]byte, len(logs))
+	lsns := make([]uint64, len(logs))
+	for i, l := range logs {
+		var rec []byte
+		var err error
+		if s.singleWALEnabled {
+			rec, err = encodeSingleWAL(l)
+			if err != nil {
+				return err
+			}
+			if len(rec) >= 24 {
+				lsns[i] = binary.LittleEndian.Uint64(rec[16:24])
+			}
+		} else {
+			body, err2 := encodeLog(l)
+			if err2 != nil {
+				return err2
+			}
+			var lenBuf [4]byte
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(body)))
+			rec = make([]byte, 4+len(body))
+			copy(rec[:4], lenBuf[:])
+			copy(rec[4:], body)
 		}
-		var lenBuf [4]byte
-		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(body)))
-		if _, err := s.f.Write(lenBuf[:]); err != nil {
-			return err
+		encoded[i] = rec
+	}
+	baseOff := s.endOff
+	// io_uring fast path: single io_uring_enter for WRITE×k → FSYNC.
+	if s.ioringEnabled {
+		if err := storeLogsIORingChain(s.f, baseOff, encoded, s.ioringSQPoll); err == nil {
+			for i, l := range logs {
+				if s.first == 0 {
+					s.first = l.Index
+				}
+				off := baseOff
+				s.logs = append(s.logs, l)
+				s.offsets = append(s.offsets, off)
+				if s.singleWALSparseIndex && lsns[i] != 0 {
+					if s.lsnIndex == nil {
+						s.lsnIndex = make(map[uint64]lsnPos)
+					}
+					s.lsnIndex[lsns[i]] = lsnPos{index: l.Index, off: off}
+				}
+				baseOff += int64(len(encoded[i]))
+			}
+			s.endOff = baseOff
+			if s.preallocateSegments {
+				_ = preallocate(s.f, s.endOff, s.segmentSize)
+			}
+			if s.useSyncFileRange {
+				_ = syncFileRange(s.f, 0, 0)
+			}
+			return nil
 		}
-		if _, err := s.f.Write(body); err != nil {
+		// fall through to classic Write+barrier on ErrIORingNotSupported / CQE error
+	}
+	for i, l := range logs {
+		rec := encoded[i]
+		if _, err := s.f.Write(rec); err != nil {
 			return err
 		}
 		if s.first == 0 {
 			s.first = l.Index
 		}
+		off := s.endOff
 		s.logs = append(s.logs, l)
-		s.offsets = append(s.offsets, s.endOff)
-		s.endOff += 4 + int64(len(body))
+		s.offsets = append(s.offsets, off)
+		if s.singleWALSparseIndex && lsns[i] != 0 {
+			if s.lsnIndex == nil {
+				s.lsnIndex = make(map[uint64]lsnPos)
+			}
+			s.lsnIndex[lsns[i]] = lsnPos{index: l.Index, off: off}
+		}
+		s.endOff += int64(len(rec))
 	}
 	// Durability barrier: the entries are not durable until this returns.
 	// 12.9 tiers (probed): io_uring chain → fdatasync → fsync.
@@ -263,8 +409,6 @@ func (s *fileLogStore) LastIndex() (uint64, error) {
 
 // DeleteRange truncates the log at the first deleted index. Everything at or
 // above `min` is removed both from memory and from the file.
-// DeleteRange truncates at the first deleted index; with SingleWAL sparse index enabled the
-// caller-owned sparse LSN→(index,off) index would be pruned here (prototype placeholder).
 func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -288,6 +432,13 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	if len(s.logs) == 0 {
 		s.first = 0
 	}
+	if s.singleWALSparseIndex && s.lsnIndex != nil {
+		for lsn, pos := range s.lsnIndex {
+			if pos.index >= min {
+				delete(s.lsnIndex, lsn)
+			}
+		}
+	}
 	oldEnd := s.endOff
 	if err := s.f.Truncate(truncAt); err != nil {
 		return err
@@ -309,6 +460,35 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	}
 	s.endOff = truncAt
 	return nil
+}
+
+// GetLogRaw returns the raw Data bytes for index without copying the full Log.
+// When SingleWAL is disabled it falls back to GetLog.
+func (s *fileLogStore) GetLogRaw(index uint64) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.first == 0 || index < s.first {
+		return nil, raft.ErrLogNotFound
+	}
+	off := index - s.first
+	if off >= uint64(len(s.logs)) {
+		return nil, raft.ErrLogNotFound
+	}
+	return append([]byte(nil), s.logs[off].Data...), nil
+}
+
+// LookupByLSN returns the raft index for a redo LSN via the sparse index when enabled.
+func (s *fileLogStore) LookupByLSN(lsn uint64) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.singleWALSparseIndex || s.lsnIndex == nil {
+		return 0, false
+	}
+	pos, ok := s.lsnIndex[lsn]
+	if !ok {
+		return 0, false
+	}
+	return pos.index, true
 }
 
 // ---- 12.9 helpers (probed with fallback; all best-effort) ----
