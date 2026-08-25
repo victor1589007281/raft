@@ -95,14 +95,14 @@ k8s scale statefulset/"$NAME" --replicas=4
 k8s rollout status statefulset/"$NAME" --timeout=120s >/dev/null
 sleep 8
 leader=$(find_leader)
-nv=$(k8s exec "$leader" -- wget -qO- http://127.0.0.1:9000/config | grep -o '"Suffrage":0' | wc -l)
+nv=$(k8s exec "$leader" -- wget -qO- http://127.0.0.1:9000/config | grep -o '"suffrage":0' | wc -l)
 echo "$NAME config voters after scale-up: $nv"
 [ "$nv" -ge 4 ] || { echo "FAIL: 4th node did not join as voter"; exit 1; }
 
 echo "-- member change: remove 4th node --"
 http "$leader" POST /remove "{\"id\":\"$NAME-3\"}" >/dev/null
 sleep 8
-nv=$(k8s exec "$leader" -- wget -qO- http://127.0.0.1:9000/config | grep -o '"Suffrage":0' | wc -l)
+nv=$(k8s exec "$leader" -- wget -qO- http://127.0.0.1:9000/config | grep -o '"suffrage":0' | wc -l)
 echo "$NAME config voters after remove: $nv"
 [ "$nv" = "3" ] || { echo "FAIL: removed node still a voter ($nv)"; exit 1; }
 # scale back down

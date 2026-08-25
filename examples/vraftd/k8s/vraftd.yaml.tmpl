@@ -4,6 +4,10 @@
 #   __BATCH_WINDOW__  -> -batch-window value ("0" disables group-commit)
 #   __ASYNC_PERSIST__ -> "1" enables the vraft async leader persist
 #   __APPEND__        -> raft MaxAppendEntries (kept identical across variants)
+#   __SINGLE_WAL__    -> "1" enables the 12.14 single-WAL v2 store format
+#   __SPARSE_INDEX__  -> "1" enables the LSN->(index,off) sparse index
+#   __WAL_CODEC__     -> -single-wal-codec value ("" or "index")
+#   __FDATASYNC__     -> "1" uses fdatasync instead of fsync
 # The headless Service gives each pod the DNS name <set>-<ordinal>.<set>.
 # Pod 0 bootstraps a fresh single-node cluster; pods 1/2 join via HTTP. Every
 # pod persists to a PVC (standard local-path storage class), so raft.log
@@ -62,6 +66,14 @@ spec:
               value: "__APPEND__"
             - name: SERVICE
               value: "__NAME__"
+            - name: SINGLE_WAL
+              value: "__SINGLE_WAL__"
+            - name: SPARSE_INDEX
+              value: "__SPARSE_INDEX__"
+            - name: WAL_CODEC
+              value: "__WAL_CODEC__"
+            - name: USE_FDATASYNC
+              value: "__FDATASYNC__"
           # The entrypoint computes the vraftd flags from the pod identity. A
           # fresh pod bootstraps only if it is ordinal 0; all other fresh pods
           # join through the headless-service DNS names. Restarted pods keep
@@ -79,6 +91,10 @@ spec:
               ARGS="-id $HOSTNAME -http 0.0.0.0:9000 -raft 0.0.0.0:9001 -raft-advertise $HOSTNAME.$SERVICE:9001 -data-dir /data -max-append-entries $MAX_APPEND -snapshot-threshold 1000000"
               [ "$BATCH_WINDOW" != "0" ] && ARGS="$ARGS -batch-window $BATCH_WINDOW"
               [ "$ASYNC_PERSIST" = "1" ] && ARGS="$ARGS -async-persist"
+              [ "$SINGLE_WAL" = "1" ] && ARGS="$ARGS -single-wal"
+              [ "$SPARSE_INDEX" = "1" ] && ARGS="$ARGS -sparse-index"
+              [ -n "$WAL_CODEC" ] && [ "$WAL_CODEC" != "none" ] && ARGS="$ARGS -single-wal-codec $WAL_CODEC"
+              [ "$USE_FDATASYNC" = "1" ] && ARGS="$ARGS -use-fdatasync"
               if [ ! -f /data/logs/raft.log ]; then
                 if [ "$HOSTNAME" = "__NAME__-0" ]; then
                   ARGS="$ARGS -bootstrap"

@@ -12,10 +12,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft/filestore"
 )
 
 // Node wires the raft instance, the replicated KV FSM and the node's own
@@ -24,6 +26,7 @@ type Node struct {
 	id           string
 	raft         *raft.Raft
 	fsm          *KVFSM
+	store        *filestore.Store
 	advertise    string
 	httpAddr     string
 	batchWindow  time.Duration
@@ -50,6 +53,9 @@ func (n *Node) httpServer() *http.Server {
 	mux.HandleFunc("/kill", n.handleKill)
 	mux.HandleFunc("/bench", n.handleBench)
 	mux.HandleFunc("/bench-read", n.handleBenchRead)
+	// 12.14 single-WAL observability: on-disk format + sparse index probes.
+	mux.HandleFunc("/storeinfo", n.handleStoreInfo)
+	mux.HandleFunc("/lookup-lsn", n.handleLookupLSN)
 
 	// Env-gated diagnostics for the async-persist hang investigation.
 	// VRAFTD_DEBUG_NET=1 logs every accepted connection (ConnState) and every
@@ -277,6 +283,34 @@ func (n *Node) handleReadAll(w http.ResponseWriter, r *http.Request) {
 		"applied": n.fsm.Applied(),
 		"kv":      n.fsm.Dump(),
 	})
+}
+
+// handleStoreInfo exposes the on-disk log store format and sparse-index
+// state — the in-cluster evidence that the single-WAL v2 format (magic
+// header, CRC, batch padding) is actually in effect (12.14).
+func (n *Node) handleStoreInfo(w http.ResponseWriter, r *http.Request) {
+	if n.store == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("no store"))
+		return
+	}
+	writeJSON(w, http.StatusOK, n.store.Stats())
+}
+
+// handleLookupLSN resolves a redo LSN to its raft index through the sparse
+// index (GET /lookup-lsn?lsn=N) — proves the index is built on writes and
+// rebuilt on reload.
+func (n *Node) handleLookupLSN(w http.ResponseWriter, r *http.Request) {
+	if n.store == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("no store"))
+		return
+	}
+	lsn, err := strconv.ParseUint(r.URL.Query().Get("lsn"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("bad lsn: %v", err))
+		return
+	}
+	idx, found := n.store.LookupByLSN(lsn)
+	writeJSON(w, http.StatusOK, map[string]any{"lsn": lsn, "index": idx, "found": found})
 }
 
 // handleStats exposes the raw raft stats map.

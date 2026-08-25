@@ -26,6 +26,7 @@ import (
 
 	armonmetrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft/filestore"
 )
 
 // inmemSink holds the armon/go-metrics in-memory interval buffer used by the
@@ -54,8 +55,9 @@ func main() {
 	ioring     = flag.Bool("ioring", false, "12.9: io_uring chain WRITE->FSYNC (probed, fallback to O_DSYNC)")
 	ioringSQPoll = flag.Bool("ioring-sqpoll", false, "12.9: io_uring SQPOLL (requires -ioring)")
 	directIO   = flag.Bool("direct-io", false, "12.9: O_DIRECT+IOPOLL tier (档位化，默认关)")
-	singleWAL  = flag.Bool("single-wal", false, "12.7: unified WAL prototype (raft log == redo segment)")
-	sparseIdx  = flag.Bool("sparse-index", false, "12.7: LSN->(index,off) sparse index (requires -single-wal)")
+	singleWAL  = flag.Bool("single-wal", false, "12.7/12.14: unified WAL v2 (magic+CRC+batch-pad512, format self-describing)")
+	sparseIdx  = flag.Bool("sparse-index", false, "12.7: LSN->(index,off) sparse index (effective on single-wal files)")
+	singleWALCodec = flag.String("single-wal-codec", "", "12.14: redo codec injection (\"\"=payload passthrough | index=stamps lsn=raft index)")
 	fsmAsync   = flag.Bool("fsm-async-persist", false, "12.7: BatchingFSM.ApplyBatch pure bookkeeping (no Sync)")
 	rpcRaw     = flag.Bool("rpc-raw-bytes", false, "12.8.2: raw-bytes GetLogRaw fast path")
 	rpcWritev  = flag.Bool("rpc-writev", false, "12.8.3: writev/net.Buffers fan-out")
@@ -96,27 +98,38 @@ func main() {
 		log.Fatalf("invalid raft advertise address %q: %v", advertiseAddr, err)
 	}
 
-	// File-backed stores.
+	// File-backed stores (library-level filestore package: 12.7/12.9/12.14).
 	logPath := filepath.Join(*dataDir, "logs", "raft.log")
 	hadData := fileExists(logPath)
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
-	logStore, err := newFileLogStore(filepath.Join(*dataDir, "logs"))
+	var codecOpt filestore.RedoCodec
+	switch *singleWALCodec {
+	case "":
+	case "index":
+		codecOpt = filestore.IndexLSNCodec{}
+	default:
+		log.Fatalf("unknown -single-wal-codec %q (\"\"|index)", *singleWALCodec)
+	}
+	fsOpts := filestore.Options{
+		SingleWAL:           *singleWAL,
+		SparseIndex:         *sparseIdx,
+		Codec:               codecOpt,
+		Fdatasync:           *useFdatasync,
+		PreallocateSegments: *preallocSeg,
+		SegmentSize:         *segSize,
+		UseFadvise:          *useFadvise,
+		UseSyncFileRange:    *useSFR,
+		IORing:              *ioring,
+		IORingSQPoll:        *ioringSQPoll,
+		Logger:              log.Default(),
+	}
+	logStore, err := filestore.Open(filepath.Join(*dataDir, "logs"), fsOpts)
 	if err != nil {
 		log.Fatalf("open log store: %v", err)
 	}
-	logStore.useFdatasync = *useFdatasync
-	logStore.preallocateSegments = *preallocSeg
-	logStore.segmentSize = *segSize
-	logStore.useFadvise = *useFadvise
-	logStore.useSyncFileRange = *useSFR
-	logStore.ioringEnabled = *ioring
-	logStore.ioringSQPoll = *ioringSQPoll
-	logStore.directIOEnabled = *directIO
-	logStore.singleWALEnabled = *singleWAL
-	logStore.singleWALSparseIndex = *sparseIdx
-	stableStore, err := newFileStableStore(filepath.Join(*dataDir, "stable"))
+	stableStore, err := filestore.OpenStable(filepath.Join(*dataDir, "stable"))
 	if err != nil {
 		log.Fatalf("open stable store: %v", err)
 	}
@@ -213,6 +226,7 @@ func main() {
 		id:           *id,
 		raft:         r,
 		fsm:          fsm,
+		store:        logStore,
 		advertise:    advertiseAddr,
 		httpAddr:     *httpAddr,
 		batchWindow:  *batchWin,

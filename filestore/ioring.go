@@ -5,7 +5,7 @@
 // io_uring_enter per batch. IORING_SETUP_SINGLE_ISSUER|DEFER_TASKRUN|COOP_TASKRUN,
 // optional SQPOLL, probed with fallback to ErrIORingNotSupported. Caller
 // (fileLogStore.StoreLogs) falls back to fdatasync/fsync on any error.
-package main
+package filestore
 
 import (
 	"encoding/binary"
