@@ -674,12 +674,55 @@ func (s *Store) reload() error {
 		return err
 	}
 	s.endOff = goodEnd
+	s.truncateAtGapLocked()
 	// Park the cursor at the end of good data; reload reads via ReadAt and
 	// never moves it. A torn tail is simply overwritten by the next append.
 	if _, err := s.f.Seek(goodEnd, io.SeekStart); err != nil {
 		return err
 	}
 	return nil
+}
+
+// truncateAtGapLocked 在重载后发现索引空洞时, 从第一个洞处截断内存视图并把
+// meta 文件 ftruncate(+v2 补零对齐), 保证 LastIndex/GetLog 一致。洞以上的后缀
+// 对 raft 不可达(processLogs 无法跨过洞 apply), 截断后由领导者按 prevLog 重铺。
+// 返回是否发生了截断。调用方须持有 s.mu(或处于 Open 单线程期)。
+func (s *Store) truncateAtGapLocked() bool {
+	for i := 1; i < len(s.logs); i++ {
+		if s.logs[i].Index == s.logs[i-1].Index+1 {
+			continue
+		}
+		cutOff := s.offsets[i]
+		if s.opts.Logger != nil {
+			s.opts.Logger.Printf("[WARN] filestore: %s 索引空洞 %d→%d —— 重载截断丢弃其上的 %d 条(等领导者重铺)",
+				s.path, s.logs[i-1].Index, s.logs[i].Index, len(s.logs)-i)
+		}
+		s.logs = s.logs[:i]
+		s.offsets = s.offsets[:i]
+		if s.format == "v2-ref" {
+			s.refSegs = s.refSegs[:i]
+			s.refBases = s.refBases[:i]
+		}
+		if err := s.f.Truncate(cutOff); err == nil {
+			if s.format == "v2-singlewal" || s.format == "v2-ref" {
+				if padded := align512(cutOff); padded > cutOff {
+					_, _ = s.f.WriteAt(make([]byte, padded-cutOff), cutOff)
+					cutOff = padded
+				}
+			}
+			s.endOff = cutOff
+		}
+		if s.lsnIndex != nil && len(s.logs) > 0 {
+			lastKept := s.logs[len(s.logs)-1].Index
+			for lsn, pos := range s.lsnIndex {
+				if pos.index > lastKept {
+					delete(s.lsnIndex, lsn)
+				}
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // writeFileHeader lays down the 512 B v2 header.
@@ -717,6 +760,22 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 	defer s.mu.Unlock()
 	if len(logs) == 0 {
 		return nil
+	}
+	// 连续性护栏: raft 契约要求追加严格连续(leader 顺序分配, follower 经
+	// prevLog/冲突截断对齐)。历史上 v2-ref 在高并发+快照压实窗口出现过一个
+	// 索引空洞(磁盘上 75304 直接跳到 75306)且一路静默, 直到 apply GetLog
+	// panic 才暴露 —— 任何不连续都必须在落盘前炸响, 而不是埋成洞。
+	if len(s.logs) > 0 {
+		if want, got := s.lastIndexLocked()+1, logs[0].Index; got != want {
+			return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole",
+				want-1, got, len(logs))
+		}
+	}
+	for i := 1; i < len(logs); i++ {
+		if logs[i].Index != logs[i-1].Index+1 {
+			return fmt.Errorf("filestore: non-contiguous batch: [%d]=%d after %d — refusing",
+				i, logs[i].Index, logs[i-1].Index)
+		}
 	}
 	if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
 		return err
@@ -924,6 +983,12 @@ func (s *Store) GetLog(index uint64, l *raft.Log) error {
 	if off >= uint64(len(s.logs)) {
 		return raft.ErrLogNotFound
 	}
+	if got := s.logs[off].Index; got != index {
+		// 位置算术命中了别的条目 —— 说明中间有洞(不连续追加)。绝不可把
+		// 错误条目静默交给调用方(raft 会拿它做 prevLog 校验/apply)。
+		return fmt.Errorf("filestore: hole detected: GetLog(%d) maps to entry %d (first=%d len=%d): %w",
+			index, got, s.first, len(s.logs), raft.ErrLogNotFound)
+	}
 	*l = *s.logs[off]
 	// ref mode: redo entries store only the pointer; reconstruct Data from
 	// redo.log (raft replication and FSM apply both read through here).
@@ -949,69 +1014,224 @@ func (s *Store) LastIndex() (uint64, error) {
 	return s.lastIndexLocked(), nil
 }
 
-// DeleteRange truncates the log at the first deleted index, both in memory
-// and on disk, and prunes the sparse index. Entries at or above min are
-// uncommitted by raft contract, so dropping them is redo-safe: the business
-// re-ships the same LSN segment idempotently via the new leader.
+// DeleteRange 删除闭区间 [min, max] 的条目, 区间外的条目必须存活(raft 契约:
+// 快照压实删前缀 [first, snapIdx-trailing], 冲突截断删后缀 [conflict, last])。
 //
-// Ref mode: only the META file is truncated — LSN is not monotonic in index
-// order (batched commits fold non-contiguous segments), so redo.log bytes are
-// never cut mid-stream; orphaned redo space is reclaimed by CompactRedo at
-// checkpoint time. v2 formats pad zeros after truncation so the next batch
-// stays 512-aligned (O_DIRECT-safe).
+// 实现分两路:
+//   - 后缀删除(min > first): 文件直接截断到 min 的记录偏移, 廉价。
+//   - 前缀/整段删除(min <= first): 追加式文件无法原地挖洞 —— 内存丢弃 +
+//     幸存者记录原字节打包重写(tmp+rename+fsync dir, 与 CompactRedo 同模式)。
+//     历史上这里错误地复用了截断路径: keep=min-first=0 → Truncate(offsets[0])
+//     → 把整个日志(包括压实必须保留的后缀)全部抹掉, 只能靠 InstallSnapshot
+//     自愈, 且在 apply 与压实交叠时直接 panic("log not found")。
+//
+// Ref 模式: 只动 meta 文件 —— LSN 不随 index 单调(批量提交折叠不连续段),
+// redo.log 字节绝不中段截断; 孤儿 redo 空间由 CompactRedo 在检查点回收。
+// v2 格式截断/重写后补零到 512B 边界, 使下一批次保持 512 对齐(O_DIRECT 安全)。
 func (s *Store) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.logs) == 0 || min > max || max < s.first {
 		return nil
 	}
-	keep := 0
+	last := s.lastIndexLocked()
+
+	// 后缀删除(冲突截断): 现有廉价截断路径。
 	if min > s.first {
-		keep = int(min - s.first)
+		keep := int(min - s.first)
 		if keep > len(s.logs) {
 			keep = len(s.logs)
 		}
+		// raft 语义上 max==last; 若调用方给了更小的 max(中段删除 —— raft 的
+		// 两个调用点(压实/冲突)都不会这样用), 防御性回落到打包重写, 绝不误删
+		// (max, last] 的存活条目。
+		if max < last {
+			return s.deleteRangeRewriteLocked(min, max)
+		}
+		truncAt := s.offsets[keep]
+		s.logs = append([]*raft.Log(nil), s.logs[:keep]...)
+		s.offsets = append([]int64(nil), s.offsets[:keep]...)
+		if s.format == "v2-ref" {
+			s.refSegs = append([][]uint64(nil), s.refSegs[:keep]...)
+			s.refBases = append([]uint64(nil), s.refBases[:keep]...)
+		}
+		if len(s.logs) == 0 {
+			s.first = 0
+		}
+		if s.lsnIndex != nil {
+			for lsn, pos := range s.lsnIndex {
+				if pos.index >= min {
+					delete(s.lsnIndex, lsn)
+				}
+			}
+		}
+		oldEnd := s.endOff
+		if err := s.f.Truncate(truncAt); err != nil {
+			return err
+		}
+		s.endOff = truncAt
+		if s.format == "v2-singlewal" || s.format == "v2-ref" {
+			if padded := align512(truncAt); padded > truncAt {
+				if _, err := s.f.WriteAt(make([]byte, padded-truncAt), truncAt); err != nil {
+					return err
+				}
+				s.endOff = padded
+			}
+		}
+		if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
+			return err
+		}
+		if err := s.barrier(); err != nil {
+			return err
+		}
+		if s.opts.UseFadvise && oldEnd > s.endOff {
+			_ = fadviseDontNeed(s.f, s.endOff, oldEnd-s.endOff)
+		}
+		return nil
 	}
-	truncAt := s.offsets[keep]
-	s.logs = append([]*raft.Log(nil), s.logs[:keep]...)
-	s.offsets = append([]int64(nil), s.offsets[:keep]...)
-	if s.format == "v2-ref" {
-		s.refSegs = append([][]uint64(nil), s.refSegs[:keep]...)
-		s.refBases = append([]uint64(nil), s.refBases[:keep]...)
-	}
-	if len(s.logs) == 0 {
+
+	// 前缀/整段删除(min <= first): 幸存者 = (max, last]。
+	return s.deleteRangeRewriteLocked(min, max)
+}
+
+// deleteRangeRewriteLocked 处理所有 min <= s.first 的删除: 把 [max,last] 外的
+// 幸存者记录原字节打包重写为新 meta 文件并原子 rename。调用方须持有 s.mu。
+func (s *Store) deleteRangeRewriteLocked(min, max uint64) error {
+	last := s.lastIndexLocked()
+	if max >= last {
+		// 整段删除(RecoverCluster): 截回起始偏移即可。
+		truncAt := int64(0)
+		if s.format == "v2-singlewal" || s.format == "v2-ref" || s.format == "v1-singlewal" {
+			truncAt = s.offsets[0] // v2=header 之后; v1/legacy=0
+		}
+		s.logs = nil
+		s.offsets = nil
+		if s.format == "v2-ref" {
+			s.refSegs = nil
+			s.refBases = nil
+		}
 		s.first = 0
+		s.lsnIndex = nil
+		if err := s.f.Truncate(truncAt); err != nil {
+			return err
+		}
+		s.endOff = truncAt
+		if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
+			return err
+		}
+		return s.barrier()
 	}
-	if s.lsnIndex != nil {
-		for lsn, pos := range s.lsnIndex {
-			if pos.index >= min {
-				delete(s.lsnIndex, lsn)
+
+	drop := int(max - s.first + 1) // 删除 [first, max], 保留 s.logs[drop:]
+	if drop <= 0 || drop >= len(s.logs) {
+		return nil
+	}
+	isV2 := s.format == "v2-singlewal" || s.format == "v2-ref"
+
+	dir := filepath.Dir(s.path)
+	tmpPath := s.path + ".compact.tmp"
+	nf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	writeOff := int64(0)
+	if isV2 {
+		hdr := make([]byte, fileHeaderLen)
+		if _, err := s.f.ReadAt(hdr, 0); err != nil { // 原样保留头部(flags)
+			nf.Close()
+			return err
+		}
+		if _, err := nf.WriteAt(hdr, 0); err != nil {
+			nf.Close()
+			return err
+		}
+		writeOff = fileHeaderLen
+	}
+	var batch bytes.Buffer
+	flush := func() error {
+		if batch.Len() == 0 {
+			return nil
+		}
+		if isV2 {
+			if pad := align512(int64(batch.Len())) - int64(batch.Len()); pad > 0 {
+				batch.Write(make([]byte, pad))
+			}
+		}
+		buf := batch.Bytes()
+		if s.directIO {
+			buf = alignedCopy(buf)
+		}
+		if _, err := nf.WriteAt(buf, writeOff); err != nil {
+			return err
+		}
+		writeOff += int64(batch.Len())
+		batch.Reset()
+		return nil
+	}
+	newOffsets := make([]int64, 0, len(s.logs)-drop)
+	for i := drop; i < len(s.logs); i++ {
+		var lenBuf [4]byte
+		if _, err := s.f.ReadAt(lenBuf[:], s.offsets[i]); err != nil {
+			nf.Close()
+			return err
+		}
+		recLen := 4 + int(binary.LittleEndian.Uint32(lenBuf[:]))
+		raw := make([]byte, recLen)
+		if _, err := s.f.ReadAt(raw, s.offsets[i]); err != nil {
+			nf.Close()
+			return err
+		}
+		newOffsets = append(newOffsets, writeOff+int64(batch.Len()))
+		batch.Write(raw)
+		if batch.Len() >= 1<<20 {
+			if err := flush(); err != nil {
+				nf.Close()
+				return err
 			}
 		}
 	}
-	oldEnd := s.endOff
-	if err := s.f.Truncate(truncAt); err != nil {
+	if err := flush(); err != nil {
+		nf.Close()
 		return err
 	}
-	s.endOff = truncAt
-	if s.format == "v2-singlewal" || s.format == "v2-ref" {
-		// Pad zeros to the next 512B boundary; the scan's zero-run rule treats
-		// this as the truncation point, and the next batch starts aligned.
-		if padded := align512(truncAt); padded > truncAt {
-			if _, err := s.f.WriteAt(make([]byte, padded-truncAt), truncAt); err != nil {
-				return err
+	if err := nf.Sync(); err != nil {
+		nf.Close()
+		return err
+	}
+	if err := nf.Close(); err != nil {
+		return err
+	}
+	// rename 成功前绝不关旧句柄(失败则旧文件仍是权威)。
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return err
+	}
+	syncDir(dir)
+	newF, err := os.OpenFile(s.path, os.O_RDWR|openDirectFlag(s.directIO), 0o644)
+	if err != nil {
+		return err
+	}
+	_ = s.f.Close()
+	s.f = newF
+	s.logs = append([]*raft.Log(nil), s.logs[drop:]...)
+	s.offsets = newOffsets
+	if s.format == "v2-ref" {
+		s.refSegs = append([][]uint64(nil), s.refSegs[drop:]...)
+		s.refBases = append([]uint64(nil), s.refBases[drop:]...)
+	}
+	s.first = s.logs[0].Index
+	s.endOff = writeOff
+	if s.lsnIndex != nil {
+		for lsn, pos := range s.lsnIndex {
+			if pos.index >= min && pos.index <= max {
+				delete(s.lsnIndex, lsn)
 			}
-			s.endOff = padded
 		}
 	}
 	if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
 		return err
 	}
-	if err := s.barrier(); err != nil {
-		return err
-	}
-	if s.opts.UseFadvise && oldEnd > s.endOff {
-		_ = fadviseDontNeed(s.f, s.endOff, oldEnd-s.endOff)
+	if s.opts.PreallocateSegments {
+		_ = preallocate(s.f, s.endOff, s.opts.SegmentSize)
 	}
 	return nil
 }

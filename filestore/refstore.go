@@ -252,16 +252,35 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 			for j, seg := range segs {
 				segLSNs[j] = seg.LSN
 				if pos, ok := s.redoMap[seg.LSN]; ok {
-					// P3 dedup: bytes already durable from the direct path —
-					// same LSN ⇒ same payload by redo semantics.
-					srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
-					if s.unboundBytes > 0 {
-						s.unboundBytes -= int64(pos.length)
-						if s.unboundBytes < 0 {
-							s.unboundBytes = 0
+					// P3 dedup: bytes already durable from the direct path.
+					// redo 语义同 LSN 同字节 —— 但故障切换窗口里旧写者可能留下同 LSN
+					// 异字节(脑裂残余): 内容不等时, 未被绑定的重写(新写者修复),
+					// 已被绑定的不动(committed 内容不可改写, 记 invariant 违例)。
+					existing, rerr := s.readRedoPayload(seg.LSN)
+					switch {
+					case rerr == nil && bytes.Equal(existing, seg.Payload):
+						srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+						if s.unboundBytes > 0 {
+							s.unboundBytes -= int64(pos.length)
+							if s.unboundBytes < 0 {
+								s.unboundBytes = 0
+							}
 						}
+						continue
+					case rerr == nil:
+						if _, bound := s.lsnIndex[seg.LSN]; bound {
+							if s.opts.Logger != nil {
+								s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), firstDiffAt(existing, seg.Payload), base)
+							}
+							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+							continue
+						}
+						if s.opts.Logger != nil {
+							s.opts.Logger.Printf("[WARN] filestore: lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", seg.LSN, len(existing), len(seg.Payload), firstDiffAt(existing, seg.Payload))
+						}
+						// fallthrough to rewrite below
 					}
-					continue
+					// rerr != nil (存在映射但读不出): 视为缺失, 重写
 				}
 				body := framer.Frame(base, seg.LSN, seg.Payload)
 				var rec [4]byte
@@ -475,6 +494,7 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	}
 	s.endOff = metaGood
 	s.redoEnd = redoGood
+	s.truncateAtGapLocked()
 	return nil
 }
 
@@ -510,6 +530,24 @@ func (s *Store) readRedoPayload(lsn uint64) ([]byte, error) {
 	}
 	_, _, payload, err := framer.Unframe(raw[4 : 4+bodyLen])
 	return payload, err
+}
+
+// firstDiffAt 返回两个字节串首个不同字节的偏移; 前缀相等但长度不同返回较短长度;
+// 完全相等返回 -1。仅供 fencing 诊断日志使用。
+func firstDiffAt(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	if len(a) != len(b) {
+		return n
+	}
+	return -1
 }
 
 // ---------------------------------------------------------------------------
