@@ -44,20 +44,22 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 		return ErrNotRefMode
 	}
 	if _, ok := s.redoMap[lsn]; ok {
-		// 幂等语义按"同 LSN 同前缀"(redo 流按位置寻址、只追加): InnoDB 对未满块
-		// 会重写同 start 的更长的段 —— 前缀相等且更长时扩展重写, 否则保留已存。
-		// 重叠区内真分叉: 已绑定(被 raft 元数据引用)报错 fencing; 未绑定重写修复。
+		// 与 storeLogsRef 同构的流快照语义: 同 LSN 重写 = 同一块的更新快照
+		// (块渐满扩展 / 块头 data_len 推进), 跨 epoch 脑裂已被 RPC fencing 拦截。
+		// 直发快照通常早于绑定快照, 故多数命中走"旧快照迟到 → 保留已存"。
 		existing, rerr := s.readRedoPayload(lsn)
 		if rerr == nil {
 			diff := firstDiffAt(existing, payload)
 			switch {
-			case diff == -1 || diff == len(payload):
-				return nil // 完全相等, 或新段是已存前缀(更短重发)
-			case diff == len(existing) && len(payload) > len(existing):
-				// 合法扩展: 落到下面重写(unboundBytes 只计增量)
+			case diff == -1:
+				return nil // 完全相等: 幂等
+			case len(payload) <= len(existing) && (diff == len(payload) || diff < redoBlockHeaderLen):
+				return nil // 旧快照迟到(更短/同长): 保留已存的更新版本
+			case len(payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
+				// 更新快照: 落到下面重写
 			default:
 				if _, bound := s.lsnIndex[lsn]; bound {
-					return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容分叉(firstDiff=%d) —— fencing", lsn, diff)
+					return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容真分叉(firstDiff=%d existLen=%d newLen=%d) —— fencing", lsn, diff, len(existing), len(payload))
 				}
 				if s.opts.Logger != nil {
 					s.opts.Logger.Printf("[WARN] filestore: direct lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", lsn, len(existing), len(payload), diff)

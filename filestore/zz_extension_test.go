@@ -59,25 +59,45 @@ func TestRefDedupBlockExtension(t *testing.T) {
 	if err := s.GetLog(2, &l); err != nil || !bytes.Equal(l.Data, want) {
 		t.Fatalf("更短重发后 GetLog(2) 被截短: %v", err)
 	}
-	// 未绑定真分叉(direct 路径): 重写修复
-	if err := s.WriteRedoDirect(0, 2000, []byte("XXXX")); err != nil {
+	// 未绑定: 头区(data_len)推进 + 更长 → 更新为更新快照
+	if err := s.WriteRedoDirect(0, 2000, append([]byte("hdrA"), bytes.Repeat([]byte("x"), 16)...)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WriteRedoDirect(0, 2000, []byte("YYYY")); err != nil {
+	if err := s.WriteRedoDirect(0, 2000, append([]byte("hdrB"), bytes.Repeat([]byte("x"), 28)...)); err != nil {
 		t.Fatal(err)
 	}
-	if p, ok := s.ReadRedo(2000); !ok || string(p) != "YYYY" {
-		t.Fatalf("未绑定异字节应重写: %q,%v", p, ok)
+	if p, ok := s.ReadRedo(2000); !ok || len(p) != 32 || string(p[:4]) != "hdrB" {
+		t.Fatalf("头区推进+更长应更新快照: len=%d,%v", len(p), ok)
 	}
-	// 已绑定真分叉(direct 路径): fencing 报错且保留已提交字节
-	if err := s.StoreLog(mkBatchEntry(4, RedoSegment{LSN: 3000, Payload: []byte("ZZZZ")})); err != nil {
+	// 未绑定: 头区外真分叉 → 重写修复(同长, 分叉在偏移 16)
+	a := append([]byte("0123456789ab"), bytes.Repeat([]byte("X"), 16)...)
+	b := append([]byte("0123456789ab"), bytes.Repeat([]byte("Y"), 16)...)
+	if err := s.WriteRedoDirect(0, 2100, a); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WriteRedoDirect(0, 3000, []byte("QQQQ")); err == nil {
-		t.Fatal("已绑定分叉应报 fencing 错误")
+	if err := s.WriteRedoDirect(0, 2100, b); err != nil {
+		t.Fatal(err)
 	}
-	if p, ok := s.ReadRedo(3000); !ok || string(p) != "ZZZZ" {
-		t.Fatalf("已绑定分叉必须保留已提交字节: %q,%v", p, ok)
+	if p, ok := s.ReadRedo(2100); !ok || !bytes.Equal(p, b) {
+		t.Fatalf("头区外异字节应重写: %v,%v", p[:12], ok)
+	}
+	// 头区同长分叉 = 旧快照迟到(直发早于绑定): 保留已存
+	if err := s.WriteRedoDirect(0, 2100, append([]byte("ZZZ"), a[3:]...)); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := s.ReadRedo(2100); !ok || !bytes.Equal(p, b) {
+		t.Fatalf("头区旧快照迟到应保留已存: %v", p[:6])
+	}
+	// 已绑定头区外真分叉(direct 路径): fencing 报错且保留已提交字节
+	if err := s.StoreLog(mkBatchEntry(4, RedoSegment{LSN: 3000, Payload: append([]byte("0123456789ab"), bytes.Repeat([]byte("Z"), 16)...)})); err != nil {
+		t.Fatal(err)
+	}
+	q := append([]byte("0123456789ab"), bytes.Repeat([]byte("Q"), 16)...)
+	if err := s.WriteRedoDirect(0, 3000, q); err == nil {
+		t.Fatal("已绑定头区外分叉应报 fencing 错误")
+	}
+	if p, ok := s.ReadRedo(3000); !ok || p[16] != 'Z' {
+		t.Fatalf("已绑定分叉必须保留已提交字节: %v,%v", p[16:], ok)
 	}
 	// direct 路径的块渐满扩展: 先短后长, direct 自己也扩展
 	if err := s.WriteRedoDirect(0, 4000, []byte("1234")); err != nil {

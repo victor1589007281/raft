@@ -253,19 +253,23 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 				segLSNs[j] = seg.LSN
 				if pos, ok := s.redoMap[seg.LSN]; ok {
 					// P3 dedup: bytes already durable from the direct path.
-					// redo 流按位置寻址、只追加不重写, 但 InnoDB log-writer 对未满块
-					// 会随数据渐满重写同 start 段: [b,b+x) 提交后 [b,b+y)(y>x) 再来。
-					// 因此"同 LSN 同字节"的精确语义是"同 LSN 同前缀"——
-					//   完全相等       → 幂等去重;
-					//   前缀相等且更长  → 合法扩展, 重写为更长记录(不改已提交前缀);
-					//   新段是已存前缀  → 保留更长者;
-					//   重叠区内真分叉  → 脑裂残余: 未绑定重写(新写者修复), 已绑定
-					//     保留已提交字节并记 fencing 违例。
-					// (旧实现把"扩展"误判为 fencing 并保留短记录: 后续条目前移到 b+y,
-					//  连续水位在 b+x 处永久留洞, 所有提交等 10s 兜底 —— tps 崩塌。)
+					// redo 流按位置寻址, 同 LSN 的重写是"同一快照的更新版本"而非分叉:
+					// InnoDB log-writer 对未满 512B 块随数据渐满重写同 start 段, 且块头
+					// 12B 内的 data_len 字段(偏移 4-5)随填充推进 —— 直发路径快照早于
+					// raft 绑定路径时, 同 LSN 两段在偏移 4/5 分叉是常态而非异常。
+					// 跨 epoch 的脑裂双写已被 RPC 层 writer_epoch fencing 拦截, 能到这里
+					// 的同 LSN 重写皆同 epoch 的块演化。判定:
+					//   完全相等                    → 幂等去重;
+					//   更长且(前缀相等 | 头区分叉)  → 更新为更新快照(重写);
+					//   更短且(是其前缀 | 头区分叉)  → 旧快照迟到, 保留已存;
+					//   头区外真分叉/异常缩短        → 未绑定重写(修复), 已绑定保留
+					//     + fencing 违例日志(真脑裂残余仅存此列)。
+					// (前史: ①把扩展误判 fencing 保留短记录 → 水位留洞 tps 崩塌;
+					//  ②把头区推进也扣在 fencing → 新鲜集群稳态下违例刷屏 + 重建读回旧头。)
 					existing, rerr := s.readRedoPayload(seg.LSN)
 					if rerr == nil {
 						diff := firstDiffAt(existing, seg.Payload)
+						_, bound := s.lsnIndex[seg.LSN]
 						switch {
 						case diff == -1:
 							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
@@ -276,17 +280,17 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 								}
 							}
 							continue
-						case diff == len(existing) && len(seg.Payload) > len(existing):
-							// 块渐满扩展: 落到重写路径(redoMap 由下方提交循环更新)。
+						case len(seg.Payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
 							if s.opts.Logger != nil {
-								s.opts.Logger.Printf("[INFO] filestore: lsn=%d 块渐满扩展重写 %d→%d 字节", seg.LSN, len(existing), len(seg.Payload))
+								s.opts.Logger.Printf("[INFO] filestore: lsn=%d 段快照更新 %d→%d 字节(firstDiff=%d, bound=%v)", seg.LSN, len(existing), len(seg.Payload), diff, bound)
 							}
-						case diff == len(seg.Payload):
-							// 更短的重发(新段是已存前缀): 保留更长者。
+							// 落到重写路径
+						case len(seg.Payload) <= len(existing) && (diff == len(seg.Payload) || diff < redoBlockHeaderLen):
+							// 更短/同长的旧快照迟到: 保留已存(更新)者
 							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
 							continue
 						default:
-							if _, bound := s.lsnIndex[seg.LSN]; bound {
+							if bound {
 								if s.opts.Logger != nil {
 									s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), diff, base)
 								}
@@ -551,8 +555,13 @@ func (s *Store) readRedoPayload(lsn uint64) ([]byte, error) {
 	return payload, err
 }
 
+// redoBlockHeaderLen: InnoDB redo 512B 块的头部长度(LOG_BLOCK_HDR_SIZE=12)。
+// 块头 data_len(偏移 4-5)随未满块填充推进 —— 同 start LSN 的两个快照在头区
+// 分叉是常态(直发快照早于绑定快照), 去重判定把头区视作可演化元数据。
+const redoBlockHeaderLen = 12
+
 // firstDiffAt 返回两个字节串首个不同字节的偏移; 前缀相等但长度不同返回较短长度;
-// 完全相等返回 -1。仅供 fencing 诊断日志使用。
+// 完全相等返回 -1。供 fencing/快照更新诊断日志与判定使用。
 func firstDiffAt(a, b []byte) int {
 	n := len(a)
 	if len(b) < n {
