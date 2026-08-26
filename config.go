@@ -217,6 +217,15 @@ type Config struct {
 	// critical path. Control commands remain ordered.
 	FsmAsyncPersist bool
 
+	// 12.14 P4 — RefReplicationEnabled allows pointer-tier AppendEntries:
+	// the leader may elide a redo entry's Data (pointer in Log.Extensions)
+	// when the follower's local redo file already holds the bytes (P3 direct
+	// data plane). Requires a ref-mode log store implementing LogDataElider /
+	// RedoByteResolver. Followers that cannot resolve answer
+	// DataMissingFrom>0 and the leader falls back to full-data replication
+	// for them (mixed clusters stay safe). Default off.
+	RefReplicationEnabled bool
+
 	// 12.8 — RPC transport (NetworkTransport)
 	RPCRawBytesEnabled bool
 	RPCWritevEnabled   bool

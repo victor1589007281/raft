@@ -1982,6 +1982,20 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			commitIndex := min(a.LeaderCommitIndex, lastNewIndex)
 			r.tryStageCommitIndex(commitIndex)
 
+			// 12.14 P4: resolve pointer-tier (elided) entries against the local
+			// redo file BEFORE storing. Unresolvable → DataMissingFrom, so the
+			// leader falls back to full-data replication for this follower.
+			// Resolution restores Data in memory; the stored entry is complete
+			// again (stores that can't resolve → reject, never silently store a
+			// Data-less entry).
+			if missIdx, err := resolveElidedEntries(r.logs, newEntries); err != nil {
+				r.logger.Warn("cannot resolve elided redo entries locally; asking leader for full data",
+					"from_index", missIdx, "error", err)
+				resp.DataMissingFrom = missIdx
+				resp.NoRetryBackoff = true
+				return
+			}
+
 			// Append the new entries
 			if err := r.logs.StoreLogs(newEntries); err != nil {
 				r.logger.Error("failed to append to logs", "error", err)

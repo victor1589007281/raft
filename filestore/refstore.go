@@ -206,10 +206,22 @@ func (s *Store) refEntrySegments(i int) []uint64 {
 	return s.refSegs[i]
 }
 
+// segRef tracks where each segment of an entry lives in redo.log: freshly
+// written by this batch (wrote) or already durable from a P3 direct write /
+// idempotent resend (skip the rewrite — the single-copy point under P3).
+type segRef struct {
+	lsn    uint64
+	off    int64
+	length int
+	wrote  bool
+}
+
 // storeLogsRef persists a batch as: redo segments appended to redo.log,
 // fixed meta records appended to raft.log, both durable in one io_uring
 // transaction (WRITE(redo)→WRITE(meta)→FSYNC→FSYNC) or the classic fallback
-// (write×2 + barrier×2).
+// (write×2 + barrier×2). Segments already present in redoMap are not
+// rewritten (idempotent dedup; their durability came from the direct path's
+// own barrier).
 func (s *Store) storeLogsRef(logs []*raft.Log) error {
 	framer := s.opts.Framer
 	if framer == nil {
@@ -218,6 +230,7 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 	var redoBuf, metaBuf bytes.Buffer
 	metas := make([]*raft.Log, len(logs)) // in-memory view: Data stripped for ref entries
 	segLists := make([][]uint64, len(logs))
+	segRefs := make([][]segRef, len(logs))
 	bases := make([]uint64, len(logs))
 
 	for i, l := range logs {
@@ -235,11 +248,25 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 			h.flags |= metaFlagRedo
 			h.base, h.lsn = base, segs[0].LSN
 			segLSNs := make([]uint64, len(segs))
+			srefs := make([]segRef, len(segs))
 			for j, seg := range segs {
+				segLSNs[j] = seg.LSN
+				if pos, ok := s.redoMap[seg.LSN]; ok {
+					// P3 dedup: bytes already durable from the direct path —
+					// same LSN ⇒ same payload by redo semantics.
+					srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+					if s.unboundBytes > 0 {
+						s.unboundBytes -= int64(pos.length)
+						if s.unboundBytes < 0 {
+							s.unboundBytes = 0
+						}
+					}
+					continue
+				}
 				body := framer.Frame(base, seg.LSN, seg.Payload)
 				var rec [4]byte
 				binary.LittleEndian.PutUint32(rec[:], uint32(len(body)))
-				segLSNs[j] = seg.LSN
+				srefs[j] = segRef{lsn: seg.LSN, off: s.redoEnd + int64(redoBuf.Len()), length: 4 + len(body), wrote: true}
 				redoBuf.Write(rec[:])
 				redoBuf.Write(body)
 			}
@@ -250,6 +277,7 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 			}
 			metaBuf.Write(encodeMetaRecord(h, tail))
 			segLists[i] = segLSNs
+			segRefs[i] = srefs
 		} else {
 			// Non-redo entry (config/noop/lease/checkpoint): Data inline.
 			metaBuf.Write(encodeMetaRecord(h, &logTail{Data: l.Data, Extensions: l.Extensions}))
@@ -294,8 +322,8 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 		}
 	}
 
-	// Commit the in-memory view. Walk metaBytes for per-record meta offsets,
-	// redoBytes for per-segment redo presence entries.
+	// Commit the in-memory view. Walk metaBytes for per-record meta offsets;
+	// per-segment presence entries come from the segRefs built above.
 	metaOff := baseOff
 	for i := range logs {
 		if s.first == 0 {
@@ -307,27 +335,21 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 		s.refBases = append(s.refBases, bases[i])
 		recLen := int64(binary.LittleEndian.Uint32(metaBytes[metaOff-baseOff:])) + 4
 		metaOff += recLen
-	}
-	rOff := redoBaseOff
-	si := 0
-	for i := range logs {
-		for _, lsn := range segLists[i] {
-			bodyLen := int64(binary.LittleEndian.Uint32(redoBytes[rOff-redoBaseOff:]))
+		for _, sr := range segRefs[i] {
 			if s.redoMap == nil {
 				s.redoMap = make(map[uint64]redoPos)
 			}
-			s.redoMap[lsn] = redoPos{off: rOff, length: int(bodyLen) + 4}
+			if sr.wrote {
+				s.redoMap[sr.lsn] = redoPos{off: sr.off, length: sr.length}
+			}
 			// ref mode: the LSN index IS the read path (LookupByLSN/ReadRedo),
 			// so it is built unconditionally, not gated on SparseIndex.
 			if s.lsnIndex == nil {
 				s.lsnIndex = make(map[uint64]lsnPos)
 			}
-			s.lsnIndex[lsn] = lsnPos{index: metas[i].Index, off: rOff}
-			rOff += 4 + bodyLen
-			si++
+			s.lsnIndex[sr.lsn] = lsnPos{index: metas[i].Index, off: sr.off}
 		}
 	}
-	_ = si
 	s.endOff = baseOff + align512(int64(len(metaBytes)))
 	if len(redoBytes) > 0 {
 		s.redoEnd = redoBaseOff + align512(int64(len(redoBytes)))

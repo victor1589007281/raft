@@ -66,6 +66,13 @@ type AppendEntriesResponse struct {
 	// There are scenarios where this request didn't succeed
 	// but there's no need to wait/back-off the next attempt.
 	NoRetryBackoff bool
+
+	// DataMissingFrom (12.14 P4): >0 when the follower rejected elided
+	// (pointer-tier) entries because its local redo file lacks the bytes —
+	// the value is the first such entry's index. The leader must resend those
+	// entries with full Data (and stick to full data for this follower until
+	// a pointer-tier request succeeds again).
+	DataMissingFrom uint64
 }
 
 // GetRPCHeader - See WithRPCHeader.

@@ -22,17 +22,28 @@ func (batchTestCodec) Split(l *raft.Log) (uint64, uint64, []byte) { return 0, 0,
 func (batchTestCodec) Merge(_, _ uint64, p []byte) []byte         { return p }
 
 func (batchTestCodec) SplitSegments(data []byte) (uint64, []RedoSegment) {
+	// codec 契约: 必须是全函数 —— 任意非 redo 字节返回 0 段, 不得越界/崩溃
 	if len(data) == 0 || data[0] == 0 {
 		return 0, nil
 	}
 	n := int(data[0])
+	if n > 1<<20 {
+		return 0, nil
+	}
 	segs := make([]RedoSegment, 0, n)
 	off := 1
 	for i := 0; i < n; i++ {
+		if off+12 > len(data) {
+			return 0, nil
+		}
 		lsn := binary.LittleEndian.Uint64(data[off:])
 		ln := int(binary.LittleEndian.Uint32(data[off+8:]))
-		segs = append(segs, RedoSegment{LSN: lsn, Payload: append([]byte(nil), data[off+12:off+12+ln]...)})
-		off += 12 + ln
+		off += 12
+		if ln < 0 || off+ln > len(data) {
+			return 0, nil
+		}
+		segs = append(segs, RedoSegment{LSN: lsn, Payload: append([]byte(nil), data[off:off+ln]...)})
+		off += ln
 	}
 	return 0, segs
 }

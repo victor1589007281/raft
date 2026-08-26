@@ -112,6 +112,11 @@ type Options struct {
 	IORingSQPoll        bool  // requires IORing
 	DirectIO            bool  // O_DIRECT tier (v2 formats only; probed, falls back to buffered)
 
+	// UnboundRedoLimit (12.14 P3): max bytes written via WriteRedoDirect but
+	// not yet bound by a committed raft entry; 0 = unlimited. Over the limit
+	// the direct write gets ErrUnboundFull (backpressure → caller degrades).
+	UnboundRedoLimit int64
+
 	Logger *log.Logger // optional; nil = silent
 }
 
@@ -267,6 +272,8 @@ type Store struct {
 
 	lsnIndex map[uint64]lsnPos // sparse index (only when SparseIndex)
 	ioringOK uint64            // io_uring chains actually completed (probe evidence)
+
+	unboundBytes int64 // P3: direct-written bytes not yet bound by raft meta
 }
 
 var _ raft.LogStore = (*Store)(nil)

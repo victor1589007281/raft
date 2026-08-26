@@ -50,6 +50,11 @@ type followerReplication struct {
 	// successful AppendEntries and InstallSnapshot.
 	matched uint64
 
+	// noElide (12.14 P4): sticky per-follower switch that disables pointer-tier
+	// elision after the follower reports DataMissingFrom (its redo file lacks
+	// the bytes). Cleared when a request containing elided entries succeeds.
+	noElide bool
+
 	// peer contains the network address and ID of the remote follower.
 	peer Server
 	// peerLock protects 'peer'
@@ -266,7 +271,28 @@ START:
 		// Clear any failures, allow pipelining
 		s.failures = 0
 		s.allowPipeline = true
+		// 12.14 P4: a success on a request that carried elided entries clears
+		// the sticky full-data mode for this follower.
+		if s.noElide {
+			for _, e := range req.Entries {
+				if e != nil && DecodeElideMarker(e.Extensions) != nil {
+					s.noElide = false
+					break
+				}
+			}
+		}
 	} else {
+		// 12.14 P4: follower lacks the redo bytes for elided entries — switch
+		// this follower to full-data replication until a pointer-tier retry
+		// succeeds again.
+		if resp.DataMissingFrom > 0 {
+			if !s.noElide {
+				r.logger.Warn("follower missing redo bytes for elided entries, falling back to full data",
+					"peer", peer, "from_index", resp.DataMissingFrom)
+				metrics.IncrCounter([]string{"raft", "replication", "elide", "fallback"}, 1)
+			}
+			s.noElide = true
+		}
 		atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))
 		if resp.NoRetryBackoff {
 			s.failures = 0
@@ -593,6 +619,24 @@ func (r *Raft) setupAppendEntries(s *followerReplication, req *AppendEntriesRequ
 	}
 	if err := r.setNewLogs(req, nextIndex, lastIndex); err != nil {
 		return err
+	}
+	// 12.14 P4: pointer-tier elision. When the store supports it (ref mode) and
+	// this follower hasn't recently reported missing bytes, redo entries go out
+	// with Data elided (pointer in Extensions). A follower that can't resolve
+	// answers DataMissingFrom>0 → we stick to full data for it (noElide) until
+	// a pointer-tier request succeeds again.
+	if r.config().RefReplicationEnabled && !s.noElide {
+		if elider, ok := r.logs.(LogDataElider); ok {
+			for i, e := range req.Entries {
+				if e == nil || len(e.Data) == 0 || len(e.Extensions) > 0 {
+					continue
+				}
+				if el, elided := elider.ElideLogData(e); elided {
+					req.Entries[i] = el
+					metrics.IncrCounter([]string{"raft", "replication", "elide"}, 1)
+				}
+			}
+		}
 	}
 	return nil
 }
