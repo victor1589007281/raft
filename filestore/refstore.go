@@ -253,32 +253,51 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 				segLSNs[j] = seg.LSN
 				if pos, ok := s.redoMap[seg.LSN]; ok {
 					// P3 dedup: bytes already durable from the direct path.
-					// redo 语义同 LSN 同字节 —— 但故障切换窗口里旧写者可能留下同 LSN
-					// 异字节(脑裂残余): 内容不等时, 未被绑定的重写(新写者修复),
-					// 已被绑定的不动(committed 内容不可改写, 记 invariant 违例)。
+					// redo 流按位置寻址、只追加不重写, 但 InnoDB log-writer 对未满块
+					// 会随数据渐满重写同 start 段: [b,b+x) 提交后 [b,b+y)(y>x) 再来。
+					// 因此"同 LSN 同字节"的精确语义是"同 LSN 同前缀"——
+					//   完全相等       → 幂等去重;
+					//   前缀相等且更长  → 合法扩展, 重写为更长记录(不改已提交前缀);
+					//   新段是已存前缀  → 保留更长者;
+					//   重叠区内真分叉  → 脑裂残余: 未绑定重写(新写者修复), 已绑定
+					//     保留已提交字节并记 fencing 违例。
+					// (旧实现把"扩展"误判为 fencing 并保留短记录: 后续条目前移到 b+y,
+					//  连续水位在 b+x 处永久留洞, 所有提交等 10s 兜底 —— tps 崩塌。)
 					existing, rerr := s.readRedoPayload(seg.LSN)
-					switch {
-					case rerr == nil && bytes.Equal(existing, seg.Payload):
-						srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
-						if s.unboundBytes > 0 {
-							s.unboundBytes -= int64(pos.length)
-							if s.unboundBytes < 0 {
-								s.unboundBytes = 0
+					if rerr == nil {
+						diff := firstDiffAt(existing, seg.Payload)
+						switch {
+						case diff == -1:
+							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+							if s.unboundBytes > 0 {
+								s.unboundBytes -= int64(pos.length)
+								if s.unboundBytes < 0 {
+									s.unboundBytes = 0
+								}
 							}
-						}
-						continue
-					case rerr == nil:
-						if _, bound := s.lsnIndex[seg.LSN]; bound {
+							continue
+						case diff == len(existing) && len(seg.Payload) > len(existing):
+							// 块渐满扩展: 落到重写路径(redoMap 由下方提交循环更新)。
 							if s.opts.Logger != nil {
-								s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), firstDiffAt(existing, seg.Payload), base)
+								s.opts.Logger.Printf("[INFO] filestore: lsn=%d 块渐满扩展重写 %d→%d 字节", seg.LSN, len(existing), len(seg.Payload))
 							}
+						case diff == len(seg.Payload):
+							// 更短的重发(新段是已存前缀): 保留更长者。
 							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
 							continue
+						default:
+							if _, bound := s.lsnIndex[seg.LSN]; bound {
+								if s.opts.Logger != nil {
+									s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), diff, base)
+								}
+								srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+								continue
+							}
+							if s.opts.Logger != nil {
+								s.opts.Logger.Printf("[WARN] filestore: lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", seg.LSN, len(existing), len(seg.Payload), diff)
+							}
+							// fallthrough to rewrite below
 						}
-						if s.opts.Logger != nil {
-							s.opts.Logger.Printf("[WARN] filestore: lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", seg.LSN, len(existing), len(seg.Payload), firstDiffAt(existing, seg.Payload))
-						}
-						// fallthrough to rewrite below
 					}
 					// rerr != nil (存在映射但读不出): 视为缺失, 重写
 				}
