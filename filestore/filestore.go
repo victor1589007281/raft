@@ -399,6 +399,12 @@ func (s *Store) Format() string {
 	return s.format
 }
 
+// IsMonotonic implements raft.MonotonicLogStore: filestore 是位置式追加存储
+// (first + 连续索引算术), 无法表示快照安装留下的低位空洞 —— 因此快照安装时
+// 走 removeOldLogs 全量删除(而非保留尾部的 compactLogs), 让 first 归零重铺,
+// 也保证 StoreLogs 连续性护栏永不误伤合法的快照重接。
+func (s *Store) IsMonotonic() bool { return true }
+
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
