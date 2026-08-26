@@ -18,6 +18,7 @@ set -euo pipefail
 CTX=${CTX:-kind-hakit}
 NS=vraft
 NAME=${1:-vraft-singlewal}
+FMT=${2:-v2-singlewal} # expected storeinfo format (v2-singlewal | v2-ref)
 RUNID=$(date +%s)
 ACKED_FILE=$(mktemp)
 trap 'rm -f "$ACKED_FILE"' EXIT
@@ -93,8 +94,19 @@ echo "leader=$leader"
 for i in 0 1 2; do
   si=$(http "$NAME-$i" GET /storeinfo) || { echo "FAIL: no /storeinfo on $NAME-$i"; exit 1; }
   echo "storeinfo $NAME-$i -> $si"
-  echo "$si" | grep -q '"format":"v2-singlewal"' || { echo "FAIL: $NAME-$i not v2-singlewal"; exit 1; }
-  echo "$si" | grep -q '"sparseIndex":true' || { echo "FAIL: $NAME-$i sparse index off"; exit 1; }
+  echo "$si" | grep -q "\"format\":\"$FMT\"" || { echo "FAIL: $NAME-$i not $FMT"; exit 1; }
+  if [ "$FMT" = "v2-singlewal" ]; then
+    echo "$si" | grep -q '"sparseIndex":true' || { echo "FAIL: $NAME-$i sparse index off"; exit 1; }
+  fi
+  if [ "$FMT" = "v2-ref" ]; then
+    # ref mode: pointer meta + separate redo data file — both must exist with
+    # VWAL magic, and both offsets must stay 512-aligned.
+    echo "$si" | grep -q '"redoEndOffset":' || { echo "FAIL: $NAME-$i no redoEndOffset (not ref)"; exit 1; }
+    rmagic=$(k8s exec "$NAME-$i" -- sh -c 'head -c 4 /data/logs/redo.log' 2>/dev/null)
+    [ "$rmagic" = "VWAL" ] || { echo "FAIL: $NAME-$i redo.log magic = '$rmagic'"; exit 1; }
+    reo=$(echo "$si" | grep -o '"redoEndOffset":[0-9]*' | cut -d: -f2)
+    [ $((reo % 512)) -eq 0 ] || { echo "FAIL: $NAME-$i redoEndOffset $reo not 512-aligned"; exit 1; }
+  fi
   magic=$(k8s exec "$NAME-$i" -- sh -c 'head -c 4 /data/logs/raft.log' 2>/dev/null)
   [ "$magic" = "VWAL" ] || { echo "FAIL: $NAME-$i raft.log magic = '$magic' (want VWAL)"; exit 1; }
 done
@@ -159,7 +171,7 @@ done
 [ "$found" = true ] || { echo "FAIL: $leader never came back"; exit 1; }
 si=$(http "$leader" GET /storeinfo)
 echo "restarted $leader storeinfo -> $si"
-echo "$si" | grep -q '"format":"v2-singlewal"' || { echo "FAIL: restarted pod format degraded"; exit 1; }
+echo "$si" | grep -q "\"format\":\"$FMT\"" || { echo "FAIL: restarted pod format degraded"; exit 1; }
 if k8s logs "$leader" 2>/dev/null | grep -qi 'panic\|corrupt\|fatal'; then
   echo "FAIL: panic/corruption in restarted pod logs"; k8s logs "$leader" | tail -5; exit 1
 fi

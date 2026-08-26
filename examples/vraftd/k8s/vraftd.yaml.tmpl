@@ -74,6 +74,10 @@ spec:
               value: "__WAL_CODEC__"
             - name: USE_FDATASYNC
               value: "__FDATASYNC__"
+            - name: WAL_MODE
+              value: "__WAL_MODE__"
+            - name: IORING
+              value: "__IORING__"
           # The entrypoint computes the vraftd flags from the pod identity. A
           # fresh pod bootstraps only if it is ordinal 0; all other fresh pods
           # join through the headless-service DNS names. Restarted pods keep
@@ -95,6 +99,8 @@ spec:
               [ "$SPARSE_INDEX" = "1" ] && ARGS="$ARGS -sparse-index"
               [ -n "$WAL_CODEC" ] && [ "$WAL_CODEC" != "none" ] && ARGS="$ARGS -single-wal-codec $WAL_CODEC"
               [ "$USE_FDATASYNC" = "1" ] && ARGS="$ARGS -use-fdatasync"
+              [ -n "$WAL_MODE" ] && [ "$WAL_MODE" != "none" ] && ARGS="$ARGS -single-wal-mode $WAL_MODE"
+              [ "$IORING" = "1" ] && ARGS="$ARGS -ioring"
               if [ ! -f /data/logs/raft.log ]; then
                 if [ "$HOSTNAME" = "__NAME__-0" ]; then
                   ARGS="$ARGS -bootstrap"

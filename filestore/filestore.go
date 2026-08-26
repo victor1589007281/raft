@@ -64,14 +64,43 @@ type IndexLSNCodec struct{}
 func (IndexLSNCodec) Split(l *raft.Log) (uint64, uint64, []byte) { return 0, l.Index, l.Data }
 func (IndexLSNCodec) Merge(_, _ uint64, payload []byte) []byte   { return payload }
 
+// RedoSegment is one redo record's worth of payload, addressed by LSN.
+type RedoSegment struct {
+	LSN     uint64
+	Payload []byte
+}
+
+// RedoSegmentCodec is the multi-segment extension of RedoCodec for ref mode:
+// one raft entry may fold N redo segments (e.g. LogDB's WriteRedoBatcher
+// cmdBatch). SplitSegments returns 0 segments for non-redo entries (they are
+// stored inline in the meta file). SplitSegments/MergeSegments must round-trip
+// Data byte-identically.
+type RedoSegmentCodec interface {
+	RedoCodec
+	SplitSegments(data []byte) (base uint64, segs []RedoSegment)
+	MergeSegments(base uint64, segs []RedoSegment) []byte
+}
+
+// Mode selects the on-disk store layout for NEW files (existing files always
+// keep their own format — auto-detected).
+type Mode string
+
+const (
+	ModeLegacy  Mode = ""        // [u32][msgpack(Log)] — upstream-compatible
+	ModeUnified Mode = "unified" // v2 single file: meta header + payload inline
+	ModeRef     Mode = "ref"     // v2 dual file: raft.log = pointer meta, redo.log = data (12.14.3)
+)
+
 // ---------------------------------------------------------------------------
 // Options: every knob defaults to off (zero value) — a zero Options is the
 // upstream-equivalent legacy store.
 type Options struct {
 	// 12.7/12.14 single WAL.
-	SingleWAL   bool      // write v2 unified format on NEW files
-	SparseIndex bool      // build LSN→(index,off) index (requires SingleWAL)
-	Codec       RedoCodec // nil = no redo envelope semantics
+	SingleWAL   bool       // write v2 unified format on NEW files (= ModeUnified)
+	Mode        Mode       // explicit layout; overrides SingleWAL when set
+	SparseIndex bool       // build LSN→(index,off) index (effective on v2/v1 files)
+	Codec       RedoCodec  // nil = no redo envelope semantics
+	Framer      RedoFramer // ref mode: redo record framing; nil = StdFramer
 
 	// 12.9 kernel I/O knobs (probed with fallback).
 	Fdatasync           bool  // Sync → Fdatasync (skip inode mtime flush)
@@ -79,8 +108,9 @@ type Options struct {
 	SegmentSize         int64 // 0 = 64 MiB
 	UseFadvise          bool  // DONTNEED truncated tail
 	UseSyncFileRange    bool  // async writeback kick mid-batch
-	IORing              bool  // io_uring WRITE→FSYNC single-enter chain
+	IORing              bool  // io_uring single-enter chain (dual-fd in ref mode)
 	IORingSQPoll        bool  // requires IORing
+	DirectIO            bool  // O_DIRECT tier (v2 formats only; probed, falls back to buffered)
 
 	Logger *log.Logger // optional; nil = silent
 }
@@ -93,7 +123,21 @@ func (o Options) Validate() error {
 	if o.IORingSQPoll && !o.IORing {
 		return fmt.Errorf("filestore: IORingSQPoll requires IORing")
 	}
+	if o.Mode != "" && o.Mode != ModeUnified && o.Mode != ModeRef {
+		return fmt.Errorf("filestore: unknown Mode %q", o.Mode)
+	}
 	return nil
+}
+
+// resolvedMode maps the switch pair to the effective new-file layout.
+func (o Options) resolvedMode() Mode {
+	if o.Mode != "" {
+		return o.Mode
+	}
+	if o.SingleWAL {
+		return ModeUnified
+	}
+	return ModeLegacy
 }
 
 // ---------------------------------------------------------------------------
@@ -141,27 +185,95 @@ type lsnPos struct {
 	off   int64
 }
 
+// redoPos is an entry of the ref-mode redo presence map (in-memory only;
+// rebuilt by scanning redo.log on reload).
+type redoPos struct {
+	off    int64
+	length int
+}
+
+// errScanStop is the internal sentinel for torn/corrupt tails in scanRecords.
+var errScanStop = errors.New("filestore: torn tail")
+
+// scanRecords walks [u32 len][body] records starting at start. When
+// padBatches (v2 formats), a zero length at a record boundary is batch-tail
+// padding: skip to the next 512B boundary once (off advances even on break so
+// endOff stays batch-aligned); a second consecutive zero = end of data.
+// yield returns errScanStop to end the scan at a torn/corrupt record.
+// Returns the end of good data (the next append position).
+func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64, body []byte) error) (int64, error) {
+	buf := bytes.NewReader(raw[start:])
+	off := start
+	zeroRun := 0
+	for {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(buf, lenBuf[:]); err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		} else if err != nil {
+			return off, err
+		}
+		n := int64(binary.LittleEndian.Uint32(lenBuf[:]))
+		if n <= 0 {
+			zeroRun++
+			if padBatches && zeroRun == 1 {
+				next := align512(off)
+				off = next
+				if next >= int64(len(raw)) {
+					break
+				}
+				if _, err := buf.Seek(next-start, io.SeekStart); err != nil {
+					return off, err
+				}
+				continue
+			}
+			break
+		}
+		zeroRun = 0
+		body := make([]byte, n)
+		if _, err := io.ReadFull(buf, body); err != nil {
+			break // crash-truncated tail
+		}
+		if err := yield(off, body); err != nil {
+			if err == errScanStop {
+				break
+			}
+			return off, err
+		}
+		off += 4 + n
+	}
+	return off, nil
+}
+
 // Store is an append-only file-backed raft.LogStore.
 type Store struct {
 	mu      sync.Mutex
 	path    string
-	f       *os.File
+	f       *os.File // raft.log (ref mode: meta records)
 	opts    Options
 	first   uint64 // index of logs[0] (0 when empty)
 	logs    []*raft.Log
 	offsets []int64 // file offset of logs[i] (points at the record's len field)
 	endOff  int64   // authoritative append position (512-aligned when v2)
 
-	format string // "v2-singlewal" | "v1-singlewal" | "legacy" — detected
+	format   string // "v2-ref" | "v2-singlewal" | "v1-singlewal" | "legacy" — detected
+	directIO bool   // effective after probe (v2 formats only)
+
+	// ref mode only: redo.log is the data file; raft.log holds pointer meta.
+	redoF    *os.File
+	redoEnd  int64              // redo.log good-data end (append position)
+	redoMap  map[uint64]redoPos // lsn → presence (data authority for reads)
+	refSegs  [][]uint64         // parallel to logs: segment LSNs of entry i (nil = inline)
+	refBases []uint64           // parallel to logs: base of entry i
 
 	lsnIndex map[uint64]lsnPos // sparse index (only when SparseIndex)
+	ioringOK uint64            // io_uring chains actually completed (probe evidence)
 }
 
 var _ raft.LogStore = (*Store)(nil)
 
 // Open opens (or creates) the log store in dir and reloads its contents.
-// The on-disk format is auto-detected; opts.SingleWAL only affects files
-// created by this call.
+// The on-disk format is auto-detected; opts.SingleWAL/Mode only affect files
+// created by this call. In ref mode dir also holds redo.log (the data file).
 func Open(dir string, opts Options) (*Store, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
@@ -175,15 +287,101 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{path: path, f: f, opts: opts}
-	if err := s.reload(); err != nil {
+
+	metaInfo, err := f.Stat()
+	if err != nil {
 		_ = f.Close()
 		return nil, err
 	}
+	metaNew := metaInfo.Size() == 0
+
+	// Resolve the layout: existing files keep their own format (detected in
+	// reload); new files follow the switches.
+	wantRef := opts.resolvedMode() == ModeRef
+	if wantRef || !metaNew {
+		// ref pairing checks happen once the format is known; open redo.log now
+		// if it exists or ref is requested.
+		redoPath := filepath.Join(dir, redoFileName)
+		if _, err := os.Stat(redoPath); err == nil || wantRef {
+			rf, err := os.OpenFile(redoPath, os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			ri, err := rf.Stat()
+			if err != nil {
+				_ = rf.Close()
+				_ = f.Close()
+				return nil, err
+			}
+			if metaNew && ri.Size() > 0 {
+				_ = rf.Close()
+				_ = f.Close()
+				return nil, fmt.Errorf("filestore: %s exists (%d B) without its meta file — refusing to guess", redoPath, ri.Size())
+			}
+			s.redoF = rf
+		}
+	}
+
+	if err := s.reload(); err != nil {
+		_ = f.Close()
+		if s.redoF != nil {
+			_ = s.redoF.Close()
+		}
+		return nil, err
+	}
+
+	// O_DIRECT tier: only for v2 formats (batch-tail padding guarantees
+	// offset/length alignment); probed per file, falls back to buffered.
+	if opts.DirectIO && (s.format == "v2-singlewal" || s.format == "v2-ref") {
+		if df, ok := reprobeDirect(path, f, opts.Logger); ok {
+			s.f = df
+			s.directIO = true
+			_ = f.Close()
+		}
+		if s.format == "v2-ref" && s.redoF != nil {
+			if df, ok := reprobeDirect(filepath.Join(dir, redoFileName), s.redoF, opts.Logger); ok {
+				_ = s.redoF.Close()
+				s.redoF = df
+			} else if !s.directIO {
+				// keep consistent: both files buffered
+			} else if opts.Logger != nil {
+				opts.Logger.Printf("[WARN] filestore: redo.log O_DIRECT probe failed, redo writes stay buffered")
+			}
+		}
+	}
 	if opts.Logger != nil {
-		opts.Logger.Printf("[INFO] filestore: %s format=%s first=%d last=%d endOff=%d",
-			path, s.format, s.first, s.lastIndexLocked(), s.endOff)
+		opts.Logger.Printf("[INFO] filestore: %s format=%s directIO=%v first=%d last=%d endOff=%d",
+			path, s.format, s.directIO, s.first, s.lastIndexLocked(), s.endOff)
 	}
 	return s, nil
+}
+
+// reprobeDirect reopens path with O_DIRECT and probes an aligned pwrite.
+// On any failure the store stays buffered (探测回退).
+func reprobeDirect(path string, cur *os.File, logger *log.Logger) (*os.File, bool) {
+	info, err := cur.Stat()
+	if err != nil {
+		return nil, false
+	}
+	df, err := os.OpenFile(path, os.O_RDWR|unix.O_DIRECT, 0o644)
+	if err != nil {
+		if logger != nil {
+			logger.Printf("[WARN] filestore: O_DIRECT open %s: %v (buffered fallback)", path, err)
+		}
+		return nil, false
+	}
+	buf := alignedBytes(512)
+	probeAt := int64(1 << 20) // beyond any real data; truncated back afterwards
+	if _, err := df.WriteAt(buf, probeAt); err != nil {
+		_ = df.Close()
+		if logger != nil {
+			logger.Printf("[WARN] filestore: O_DIRECT probe write %s: %v (buffered fallback)", path, err)
+		}
+		return nil, false
+	}
+	_ = df.Truncate(info.Size())
+	return df, true
 }
 
 // Format returns the detected on-disk format ("v2-singlewal" / "v1-singlewal" /
@@ -199,6 +397,14 @@ func (s *Store) Close() error {
 	defer s.mu.Unlock()
 	if err := s.f.Sync(); err != nil {
 		return err
+	}
+	if s.redoF != nil {
+		if err := s.redoF.Sync(); err != nil {
+			return err
+		}
+		if err := s.redoF.Close(); err != nil {
+			return err
+		}
 	}
 	return s.f.Close()
 }
@@ -330,10 +536,12 @@ func align512(off int64) int64 { return (off + 511) &^ 511 }
 // ---------------------------------------------------------------------------
 // Reload with format auto-detection and torn-tail handling.
 //
-// Detection order: v2 magic → v1 sniff (ver field) → legacy. The detected
-// format governs both reading AND subsequent appends: a legacy file keeps
-// receiving legacy records even when SingleWAL is on (探测回退/在线兼容),
+// Detection order: v2 magic (+ref flag) → v1 sniff (ver field) → legacy. The
+// detected format governs both reading AND subsequent appends: a legacy file
+// keeps receiving legacy records even when SingleWAL is on (探测回退/在线兼容),
 // so an operator can flip the switch without corrupting existing PVCs.
+// Ref mode reads redo.log (data authority) first, then the meta file, and
+// drops meta entries whose redo bytes were torn away (12.14.3 ③).
 func (s *Store) reload() error {
 	if err := s.f.Sync(); err != nil {
 		return err
@@ -342,81 +550,90 @@ func (s *Store) reload() error {
 	if err != nil {
 		return err
 	}
-	raw := make([]byte, info.Size())
-	if _, err := s.f.ReadAt(raw, 0); err != nil && err != io.EOF {
+	raw, err := s.readWhole(s.f, info.Size())
+	if err != nil {
 		return err
 	}
 
-	start := int64(0)
-	s.format = "legacy"
+	mode := s.opts.resolvedMode()
 	if len(raw) == 0 {
-		// New file: pick format from the switch and lay down the v2 header.
-		if s.opts.SingleWAL {
-			s.format = "v2-singlewal"
-			hdr := make([]byte, fileHeaderLen)
-			copy(hdr[0:4], fileMagic)
-			binary.LittleEndian.PutUint16(hdr[4:6], formatV2)
-			binary.LittleEndian.PutUint16(hdr[6:8], fileFlagSingleWAL|fileFlagPad512)
-			if _, err := s.f.WriteAt(hdr, 0); err != nil {
+		// New file: pick format from the switches and lay down the header(s).
+		switch mode {
+		case ModeUnified, ModeRef:
+			s.format = map[Mode]string{ModeUnified: "v2-singlewal", ModeRef: "v2-ref"}[mode]
+			flags := uint16(fileFlagSingleWAL | fileFlagPad512)
+			if mode == ModeRef {
+				flags |= fileFlagRef
+			}
+			if err := writeFileHeader(s.f, flags); err != nil {
 				return err
 			}
-			if err := s.f.Sync(); err != nil {
-				return err
+			if mode == ModeRef {
+				if s.redoF == nil {
+					return fmt.Errorf("filestore: ref mode requires redo.log")
+				}
+				if err := writeFileHeader(s.redoF, fileFlagSingleWAL|fileFlagPad512|fileFlagRef|fileFlagData); err != nil {
+					return err
+				}
+				s.redoEnd = fileHeaderLen
 			}
 			s.endOff = fileHeaderLen
 			_, err := s.f.Seek(fileHeaderLen, io.SeekStart)
 			return err
+		default:
+			s.format = "legacy"
+			return nil
 		}
-	} else if len(raw) >= fileHeaderLen && string(raw[0:4]) == fileMagic &&
-		binary.LittleEndian.Uint16(raw[4:6]) == formatV2 {
-		s.format = "v2-singlewal"
+	}
+
+	// Existing file: detect.
+	start := int64(0)
+	s.format = "legacy"
+	switch {
+	case len(raw) >= fileHeaderLen && string(raw[0:4]) == fileMagic &&
+		binary.LittleEndian.Uint16(raw[4:6]) == formatV2:
+		flags := binary.LittleEndian.Uint16(raw[6:8])
+		if flags&fileFlagRef != 0 {
+			s.format = "v2-ref"
+		} else {
+			s.format = "v2-singlewal"
+		}
 		start = fileHeaderLen
-	} else if len(raw) >= 6 && binary.LittleEndian.Uint16(raw[4:6]) == 1 {
+	case len(raw) >= 6 && binary.LittleEndian.Uint16(raw[4:6]) == 1:
 		// v1 prototype: [u32 len][u16 ver=1]... (legacy msgpack never starts
 		// with bytes 0x01 0x00 at [4:6] — its body starts with a fixmap).
 		s.format = "v1-singlewal"
 	}
-	if s.format != "legacy" && s.opts.Logger != nil && !s.opts.SingleWAL {
-		s.opts.Logger.Printf("[INFO] filestore: %s is %s, ignoring SingleWAL=off (format follows file)", s.path, s.format)
+	if s.format != "legacy" && s.opts.Logger != nil && mode == ModeLegacy {
+		s.opts.Logger.Printf("[INFO] filestore: %s is %s, write switch off (format follows file)", s.path, s.format)
 	}
 
-	buf := bytes.NewReader(raw[start:])
-	off := start
-	zeroRun := 0
-	for {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(buf, lenBuf[:]); err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		} else if err != nil {
+	if s.format == "v2-ref" {
+		if s.redoF == nil {
+			return fmt.Errorf("filestore: %s is v2-ref but redo.log is missing", s.path)
+		}
+		ri, err := s.redoF.Stat()
+		if err != nil {
 			return err
 		}
-		n := int64(binary.LittleEndian.Uint32(lenBuf[:]))
-		if n <= 0 {
-			zeroRun++
-			if s.format == "v2-singlewal" && zeroRun == 1 {
-				// Batch-tail padding: advance to the next 512 B boundary.
-				// off must advance EVEN when we break (end-of-data), so that
-				// endOff stays batch-aligned and the next append does not
-				// start mid-padding (which would strand it after a skip).
-				// NB: the reader already consumed the 4-byte length field,
-				// so seek ABSOLUTELY (slice-relative), not relative to off.
-				next := align512(off)
-				off = next
-				if next >= int64(len(raw)) {
-					break
-				}
-				if _, err := buf.Seek(next-start, io.SeekStart); err != nil {
-					return err
-				}
-				continue
-			}
-			break // second consecutive zero run: fallocate'd tail / end of data
+		rawRedo, err := s.readWhole(s.redoF, ri.Size())
+		if err != nil {
+			return err
 		}
-		zeroRun = 0
-		body := make([]byte, n)
-		if _, err := io.ReadFull(buf, body); err != nil {
-			break // crash-truncated tail
+		if err := s.reloadRef(raw, rawRedo); err != nil {
+			return err
 		}
+		if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := s.redoF.Seek(s.redoEnd, io.SeekStart); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	padBatches := s.format == "v2-singlewal"
+	goodEnd, err := scanRecords(raw, start, padBatches, func(off int64, body []byte) error {
 		var l *raft.Log
 		var lsn uint64
 		var derr error
@@ -431,7 +648,7 @@ func (s *Store) reload() error {
 			l = ll
 		}
 		if derr != nil {
-			break // corrupt/torn tail — treat as truncation point
+			return errScanStop // corrupt/torn tail — truncation point
 		}
 		if s.first == 0 {
 			s.first = l.Index
@@ -444,15 +661,45 @@ func (s *Store) reload() error {
 			}
 			s.lsnIndex[lsn] = lsnPos{index: l.Index, off: off}
 		}
-		off += 4 + n
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	s.endOff = off
+	s.endOff = goodEnd
 	// Park the cursor at the end of good data; reload reads via ReadAt and
 	// never moves it. A torn tail is simply overwritten by the next append.
-	if _, err := s.f.Seek(off, io.SeekStart); err != nil {
+	if _, err := s.f.Seek(goodEnd, io.SeekStart); err != nil {
 		return err
 	}
 	return nil
+}
+
+// writeFileHeader lays down the 512 B v2 header.
+func writeFileHeader(f *os.File, flags uint16) error {
+	hdr := make([]byte, fileHeaderLen)
+	copy(hdr[0:4], fileMagic)
+	binary.LittleEndian.PutUint16(hdr[4:6], formatV2)
+	binary.LittleEndian.PutUint16(hdr[6:8], flags)
+	if _, err := f.WriteAt(hdr, 0); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// readWhole reads size bytes from f at offset 0, honoring O_DIRECT alignment.
+func (s *Store) readWhole(f *os.File, size int64) ([]byte, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if s.directIO {
+		return readAtAligned(f, 0, int(size))
+	}
+	raw := make([]byte, size)
+	if _, err := f.ReadAt(raw, 0); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +715,9 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 		return err
 	}
 
+	if s.format == "v2-ref" {
+		return s.storeLogsRef(logs)
+	}
 	if s.format == "v2-singlewal" {
 		return s.storeLogsV2(logs)
 	}
@@ -528,10 +778,14 @@ func (s *Store) storeLogsV2(logs []*raft.Log) error {
 		batch.Write(make([]byte, pad))
 	}
 	buf := batch.Bytes()
+	if s.directIO {
+		buf = alignedCopy(buf)
+	}
 	baseOff := s.endOff
 
 	if s.opts.IORing {
 		if err := storeLogsIORingChain(s.f, baseOff, [][]byte{buf}, s.opts.IORingSQPoll); err == nil {
+			s.ioringOK++
 			s.commitBatch(logs, lsns, baseOff, buf)
 			return nil
 		}
@@ -592,6 +846,7 @@ func (s *Store) storeLogsLegacy(logs []*raft.Log) error {
 	baseOff := s.endOff
 	if s.opts.IORing {
 		if err := storeLogsIORingChain(s.f, baseOff, encoded, s.opts.IORingSQPoll); err == nil {
+			s.ioringOK++
 			for i, l := range logs {
 				if s.first == 0 {
 					s.first = l.Index
@@ -633,17 +888,21 @@ func (s *Store) storeLogsLegacy(logs []*raft.Log) error {
 	return nil
 }
 
-// barrier is the durability barrier: io_uring FSYNC → fdatasync → fsync.
-func (s *Store) barrier() error {
+// barrier is the durability barrier on the main (meta/unified) file.
+func (s *Store) barrier() error { return s.barrierOn(s.f) }
+
+// barrierOn: io_uring FSYNC → fdatasync → fsync, per fd.
+func (s *Store) barrierOn(f *os.File) error {
 	if s.opts.IORing {
-		if err := ioringFsync(s.f, s.opts.IORingSQPoll); err == nil {
+		if err := ioringFsync(f, s.opts.IORingSQPoll); err == nil {
+			s.ioringOK++
 			return nil
 		}
 	}
 	if s.opts.Fdatasync {
-		return fdatasync(s.f)
+		return fdatasync(f)
 	}
-	return s.f.Sync()
+	return f.Sync()
 }
 
 func (s *Store) StoreLog(l *raft.Log) error { return s.StoreLogs([]*raft.Log{l}) }
@@ -659,6 +918,15 @@ func (s *Store) GetLog(index uint64, l *raft.Log) error {
 		return raft.ErrLogNotFound
 	}
 	*l = *s.logs[off]
+	// ref mode: redo entries store only the pointer; reconstruct Data from
+	// redo.log (raft replication and FSM apply both read through here).
+	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
+		data, err := s.mergeEntry(s.refBases[off], s.refSegs[off])
+		if err != nil {
+			return err
+		}
+		l.Data = data
+	}
 	return nil
 }
 
@@ -678,6 +946,12 @@ func (s *Store) LastIndex() (uint64, error) {
 // and on disk, and prunes the sparse index. Entries at or above min are
 // uncommitted by raft contract, so dropping them is redo-safe: the business
 // re-ships the same LSN segment idempotently via the new leader.
+//
+// Ref mode: only the META file is truncated — LSN is not monotonic in index
+// order (batched commits fold non-contiguous segments), so redo.log bytes are
+// never cut mid-stream; orphaned redo space is reclaimed by CompactRedo at
+// checkpoint time. v2 formats pad zeros after truncation so the next batch
+// stays 512-aligned (O_DIRECT-safe).
 func (s *Store) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -694,6 +968,10 @@ func (s *Store) DeleteRange(min, max uint64) error {
 	truncAt := s.offsets[keep]
 	s.logs = append([]*raft.Log(nil), s.logs[:keep]...)
 	s.offsets = append([]int64(nil), s.offsets[:keep]...)
+	if s.format == "v2-ref" {
+		s.refSegs = append([][]uint64(nil), s.refSegs[:keep]...)
+		s.refBases = append([]uint64(nil), s.refBases[:keep]...)
+	}
 	if len(s.logs) == 0 {
 		s.first = 0
 	}
@@ -708,16 +986,26 @@ func (s *Store) DeleteRange(min, max uint64) error {
 	if err := s.f.Truncate(truncAt); err != nil {
 		return err
 	}
-	if _, err := s.f.Seek(truncAt, io.SeekStart); err != nil {
+	s.endOff = truncAt
+	if s.format == "v2-singlewal" || s.format == "v2-ref" {
+		// Pad zeros to the next 512B boundary; the scan's zero-run rule treats
+		// this as the truncation point, and the next batch starts aligned.
+		if padded := align512(truncAt); padded > truncAt {
+			if _, err := s.f.WriteAt(make([]byte, padded-truncAt), truncAt); err != nil {
+				return err
+			}
+			s.endOff = padded
+		}
+	}
+	if _, err := s.f.Seek(s.endOff, io.SeekStart); err != nil {
 		return err
 	}
 	if err := s.barrier(); err != nil {
 		return err
 	}
-	if s.opts.UseFadvise && oldEnd > truncAt {
-		_ = fadviseDontNeed(s.f, truncAt, oldEnd-truncAt)
+	if s.opts.UseFadvise && oldEnd > s.endOff {
+		_ = fadviseDontNeed(s.f, s.endOff, oldEnd-s.endOff)
 	}
-	s.endOff = truncAt
 	return nil
 }
 
@@ -732,14 +1020,23 @@ func (s *Store) GetLogRaw(index uint64) ([]byte, error) {
 	if off >= uint64(len(s.logs)) {
 		return nil, raft.ErrLogNotFound
 	}
+	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
+		data, err := s.mergeEntry(s.refBases[off], s.refSegs[off])
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
 	return append([]byte(nil), s.logs[off].Data...), nil
 }
 
 // LookupByLSN resolves a redo LSN to its raft index via the sparse index.
+// The index is populated when: unified/v1 + SparseIndex switch, or ref mode
+// (unconditionally — it is the read path).
 func (s *Store) LookupByLSN(lsn uint64) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.opts.SparseIndex || s.lsnIndex == nil {
+	if s.lsnIndex == nil {
 		return 0, false
 	}
 	pos, ok := s.lsnIndex[lsn]
@@ -751,27 +1048,78 @@ func (s *Store) LookupByLSN(lsn uint64) (uint64, bool) {
 
 // Stats is an observability snapshot for /storeinfo-style endpoints.
 type Stats struct {
-	Format      string `json:"format"`
-	SparseIndex bool   `json:"sparseIndex"`
-	LSNEntries  int    `json:"lsnEntries"`
-	FirstIndex  uint64 `json:"firstIndex"`
-	LastIndex   uint64 `json:"lastIndex"`
-	EndOffset   int64  `json:"endOffset"`
-	IORing      bool   `json:"ioRing"`
+	Format        string `json:"format"`
+	SparseIndex   bool   `json:"sparseIndex"`
+	LSNEntries    int    `json:"lsnEntries"`
+	FirstIndex    uint64 `json:"firstIndex"`
+	LastIndex     uint64 `json:"lastIndex"`
+	EndOffset     int64  `json:"endOffset"`
+	RedoEndOffset int64  `json:"redoEndOffset,omitempty"`
+	IORing        bool   `json:"ioRing"`
+	IORingOK      uint64 `json:"ioRingOK"` // chains actually completed (probe evidence)
+	DirectIO      bool   `json:"directIO"`
 }
 
 func (s *Store) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Stats{
-		Format:      s.format,
-		SparseIndex: s.opts.SparseIndex,
-		LSNEntries:  len(s.lsnIndex),
-		FirstIndex:  s.first,
-		LastIndex:   s.lastIndexLocked(),
-		EndOffset:   s.endOff,
-		IORing:      s.opts.IORing,
+		Format:        s.format,
+		SparseIndex:   s.opts.SparseIndex,
+		LSNEntries:    len(s.lsnIndex),
+		FirstIndex:    s.first,
+		LastIndex:     s.lastIndexLocked(),
+		EndOffset:     s.endOff,
+		RedoEndOffset: s.redoEnd,
+		IORing:        s.opts.IORing,
+		IORingOK:      s.ioringOK,
+		DirectIO:      s.directIO,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Ref-mode business read API (12.14.3): the redo view of the store.
+
+// LookupRedo resolves an lsn to its redo.log offset/length (presence map).
+func (s *Store) LookupRedo(lsn uint64) (off int64, length int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pos, ok := s.redoMap[lsn]
+	return pos.off, pos.length, ok
+}
+
+// ReadRedo returns the redo payload for an lsn (unframed, pre-Merge).
+func (s *Store) ReadRedo(lsn uint64) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, err := s.readRedoPayload(lsn)
+	if err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+// ReadRedoRaw returns the raw framed record bytes (u32 length prefix +
+// framer body) for an lsn — what a business reader ships downstream.
+func (s *Store) ReadRedoRaw(lsn uint64) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pos, ok := s.redoMap[lsn]
+	if !ok {
+		return nil, false
+	}
+	if s.directIO {
+		raw, err := readAtAligned(s.redoF, pos.off, pos.length)
+		if err != nil {
+			return nil, false
+		}
+		return raw[:pos.length], true
+	}
+	raw := make([]byte, pos.length)
+	if _, err := s.redoF.ReadAt(raw, pos.off); err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 // ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ func main() {
 	ioringSQPoll = flag.Bool("ioring-sqpoll", false, "12.9: io_uring SQPOLL (requires -ioring)")
 	directIO   = flag.Bool("direct-io", false, "12.9: O_DIRECT+IOPOLL tier (档位化，默认关)")
 	singleWAL  = flag.Bool("single-wal", false, "12.7/12.14: unified WAL v2 (magic+CRC+batch-pad512, format self-describing)")
+	singleWALMode = flag.String("single-wal-mode", "", "12.14: explicit store layout: \"\"(auto)|unified|ref (ref = raft.log pointer meta + redo.log data, dual-fd single enter)")
 	sparseIdx  = flag.Bool("sparse-index", false, "12.7: LSN->(index,off) sparse index (effective on single-wal files)")
 	singleWALCodec = flag.String("single-wal-codec", "", "12.14: redo codec injection (\"\"=payload passthrough | index=stamps lsn=raft index)")
 	fsmAsync   = flag.Bool("fsm-async-persist", false, "12.7: BatchingFSM.ApplyBatch pure bookkeeping (no Sync)")
@@ -114,6 +115,7 @@ func main() {
 	}
 	fsOpts := filestore.Options{
 		SingleWAL:           *singleWAL,
+		Mode:                filestore.Mode(*singleWALMode),
 		SparseIndex:         *sparseIdx,
 		Codec:               codecOpt,
 		Fdatasync:           *useFdatasync,
@@ -123,6 +125,7 @@ func main() {
 		UseSyncFileRange:    *useSFR,
 		IORing:              *ioring,
 		IORingSQPoll:        *ioringSQPoll,
+		DirectIO:            *directIO,
 		Logger:              log.Default(),
 	}
 	logStore, err := filestore.Open(filepath.Join(*dataDir, "logs"), fsOpts)
