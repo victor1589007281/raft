@@ -185,6 +185,13 @@ type Config struct {
 	// immediately after a non-blocking gather of whatever is already queued.
 	BatchWindow time.Duration
 
+	// BatchWindowAdaptive (vraft 12.14, 默认 false): 低载免窗。开启后攒批循环
+	// 先给一个短 grace(窗口的 1/10, 下限 500µs)等第二条; grace 内无新增且批
+	// 仍只有 1 条 → 立即派发, 不付整个 BatchWindow(消除低并发固定窗口税,
+	// 实测 t4 档 5ms 固定窗口把 51→36 tps); grace 内有来活则照常等满窗口
+	// (高载批因子不变)。仅在 BatchWindow > 0 时有意义。
+	BatchWindowAdaptive bool
+
 	// AsyncLeaderPersist enables the leader's own log-store write (including
 	// fsync) to run asynchronously, overlapped with replication to followers
 	// (提前 fsync / Raft thesis §10.2.1). With this enabled, the leader

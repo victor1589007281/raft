@@ -1073,21 +1073,44 @@ func (r *Raft) leaderLoop() {
 				// low-concurrency writer can coalesce multiple appends into one batch
 				// and pay one StoreLogs + one replication round per batch. Dispatch
 				// as soon as the batch fills MaxAppendEntries or the window expires.
-				timer := time.NewTimer(w)
-			GROUP_COMMIT_WINDOW:
-				for i := 1; i < r.config().MaxAppendEntries; i++ {
+				skipWindow := false
+				if r.config().BatchWindowAdaptive {
+					// 低载免窗: 先给短 grace 等第二条, 无来活且批仍 1 条 → 跳过窗口
+					// 立即派发(消除低并发固定窗口税); grace 内来活则照常等满窗口。
+					grace := w / 10
+					if grace < 500*time.Microsecond {
+						grace = 500 * time.Microsecond
+					}
+					gt := time.NewTimer(grace)
 					select {
 					case newLog := <-r.applyCh:
 						ready = append(ready, newLog)
-					case <-timer.C:
-						break GROUP_COMMIT_WINDOW
+					case <-gt.C:
+						skipWindow = len(ready) <= 1
+					}
+					gt.Stop()
+					select {
+					case <-gt.C:
+					default:
 					}
 				}
-				timer.Stop()
-				// Drain a fired timer so the channel is not left readable.
-				select {
-				case <-timer.C:
-				default:
+				if !skipWindow {
+					timer := time.NewTimer(w)
+				GROUP_COMMIT_WINDOW:
+					for i := 1; i < r.config().MaxAppendEntries; i++ {
+						select {
+						case newLog := <-r.applyCh:
+							ready = append(ready, newLog)
+						case <-timer.C:
+							break GROUP_COMMIT_WINDOW
+						}
+					}
+					timer.Stop()
+					// Drain a fired timer so the channel is not left readable.
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
 			} else {
 				// Default behavior: dispatch after a non-blocking gather of whatever
