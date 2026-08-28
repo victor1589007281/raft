@@ -250,12 +250,24 @@ func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64,
 }
 
 // Store is an append-only file-backed raft.LogStore.
+//
+// 锁契约(12.14 读锁分离):
+//   - mu(RWMutex) 护全部内存状态与文件偏移(logs/offsets/redoMap/refSegs/
+//     refBases/lsnIndex/redoEnd/unboundBytes/fd 身份)。写者 Lock; 纯内存
+//     查询 RLock。redo.log 记录 append-only 且落位后不可变(去重重写 = 追加
+//     新版本 + 换 map 指针, 绝不原地覆盖), 故读者在 RLock 内抓拍 (fd,off,len)
+//     后即可【锁外读盘】—— apply 路径的 mergeEntry 重建读不再与 StoreLogs
+//     的 fsync / 直发写在大锁里互相挤(G 相对 G0 的 -20% 税的来源)。
+//   - redoIoMu(RWMutex) 只钉 redoF 身份: 锁外读者在 ReadAt 期间持 RLock;
+//     CompactRedo 换刀(rename 后关旧 fd)持 Lock。锁序 mu → redoIoMu
+//     (读者先放 mu 再取 redoIoMu, 压实同时持两把, 无环)。
 type Store struct {
-	mu      sync.Mutex
-	path    string
-	f       *os.File // raft.log (ref mode: meta records)
-	opts    Options
-	first   uint64 // index of logs[0] (0 when empty)
+	mu       sync.RWMutex
+	redoIoMu sync.RWMutex
+	path     string
+	f        *os.File // raft.log (ref mode: meta records)
+	opts     Options
+	first    uint64 // index of logs[0] (0 when empty)
 	logs    []*raft.Log
 	offsets []int64 // file offset of logs[i] (points at the record's len field)
 	endOff  int64   // authoritative append position (512-aligned when v2)
@@ -394,8 +406,8 @@ func reprobeDirect(path string, cur *os.File, logger *log.Logger) (*os.File, boo
 // Format returns the detected on-disk format ("v2-singlewal" / "v1-singlewal" /
 // "legacy") — the file's own format, independent of the current switches.
 func (s *Store) Format() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.format
 }
 
@@ -415,6 +427,9 @@ func (s *Store) Close() error {
 		if err := s.redoF.Sync(); err != nil {
 			return err
 		}
+		// 等锁外读者(mergeEntry/ReadRedo*)的 in-flight ReadAt 收工再关 fd。
+		s.redoIoMu.Lock()
+		defer s.redoIoMu.Unlock()
 		if err := s.redoF.Close(); err != nil {
 			return err
 		}
@@ -980,43 +995,57 @@ func (s *Store) barrierOn(f *os.File) error {
 func (s *Store) StoreLog(l *raft.Log) error { return s.StoreLogs([]*raft.Log{l}) }
 
 func (s *Store) GetLog(index uint64, l *raft.Log) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	if s.first == 0 || index < s.first {
+		s.mu.RUnlock()
 		return raft.ErrLogNotFound
 	}
 	off := index - s.first
 	if off >= uint64(len(s.logs)) {
+		s.mu.RUnlock()
 		return raft.ErrLogNotFound
 	}
 	if got := s.logs[off].Index; got != index {
 		// 位置算术命中了别的条目 —— 说明中间有洞(不连续追加)。绝不可把
 		// 错误条目静默交给调用方(raft 会拿它做 prevLog 校验/apply)。
+		s.mu.RUnlock()
 		return fmt.Errorf("filestore: hole detected: GetLog(%d) maps to entry %d (first=%d len=%d): %w",
 			index, got, s.first, len(s.logs), raft.ErrLogNotFound)
 	}
 	*l = *s.logs[off]
 	// ref mode: redo entries store only the pointer; reconstruct Data from
 	// redo.log (raft replication and FSM apply both read through here).
+	// 12.14 读锁分离: 抓拍 (base, segLSNs, 位置, fd) 在同一个 RLock 临界区内
+	// 完成并持链移交 redoIoMu.RLock(无 TOCTOU, 压实换刀被排在外), 盘读与
+	// 合并放锁外 —— redo.log append-only 不可变。
 	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
-		data, err := s.mergeEntry(s.refBases[off], s.refSegs[off])
+		base := s.refBases[off]
+		segLSNs := append([]uint64(nil), s.refSegs[off]...)
+		f, poss, err := s.pinRefReadLocked(segLSNs)
+		if err != nil {
+			return err // mu 已放
+		}
+		data, err := s.mergeCaptured(f, base, segLSNs, poss)
+		s.redoIoMu.RUnlock()
 		if err != nil {
 			return err
 		}
 		l.Data = data
+		return nil
 	}
+	s.mu.RUnlock()
 	return nil
 }
 
 func (s *Store) FirstIndex() (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.first, nil
 }
 
 func (s *Store) LastIndex() (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.lastIndexLocked(), nil
 }
 
@@ -1244,31 +1273,38 @@ func (s *Store) deleteRangeRewriteLocked(min, max uint64) error {
 
 // GetLogRaw returns the raw Data bytes for index (12.8.2 raw-bytes path).
 func (s *Store) GetLogRaw(index uint64) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	if s.first == 0 || index < s.first {
+		s.mu.RUnlock()
 		return nil, raft.ErrLogNotFound
 	}
 	off := index - s.first
 	if off >= uint64(len(s.logs)) {
+		s.mu.RUnlock()
 		return nil, raft.ErrLogNotFound
 	}
 	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
-		data, err := s.mergeEntry(s.refBases[off], s.refSegs[off])
+		base := s.refBases[off]
+		segLSNs := append([]uint64(nil), s.refSegs[off]...)
+		f, poss, err := s.pinRefReadLocked(segLSNs)
 		if err != nil {
-			return nil, err
+			return nil, err // mu 已放
 		}
-		return data, nil
+		data, err := s.mergeCaptured(f, base, segLSNs, poss)
+		s.redoIoMu.RUnlock()
+		return data, err
 	}
-	return append([]byte(nil), s.logs[off].Data...), nil
+	data := append([]byte(nil), s.logs[off].Data...)
+	s.mu.RUnlock()
+	return data, nil
 }
 
 // LookupByLSN resolves a redo LSN to its raft index via the sparse index.
 // The index is populated when: unified/v1 + SparseIndex switch, or ref mode
 // (unconditionally — it is the read path).
 func (s *Store) LookupByLSN(lsn uint64) (uint64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.lsnIndex == nil {
 		return 0, false
 	}
@@ -1294,8 +1330,8 @@ type Stats struct {
 }
 
 func (s *Store) Stats() Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return Stats{
 		Format:        s.format,
 		SparseIndex:   s.opts.SparseIndex,
@@ -1315,17 +1351,26 @@ func (s *Store) Stats() Stats {
 
 // LookupRedo resolves an lsn to its redo.log offset/length (presence map).
 func (s *Store) LookupRedo(lsn uint64) (off int64, length int, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	pos, ok := s.redoMap[lsn]
 	return pos.off, pos.length, ok
 }
 
 // ReadRedo returns the redo payload for an lsn (unframed, pre-Merge).
+// 两阶段: mu.RLock 抓拍位置+fd, 持链移交 redoIoMu.RLock 后锁外读盘。
 func (s *Store) ReadRedo(lsn uint64) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	payload, err := s.readRedoPayload(lsn)
+	s.mu.RLock()
+	pos, ok := s.redoMap[lsn]
+	f := s.redoF
+	if !ok || f == nil {
+		s.mu.RUnlock()
+		return nil, false
+	}
+	s.redoIoMu.RLock()
+	s.mu.RUnlock()
+	defer s.redoIoMu.RUnlock()
+	payload, err := s.readRedoAt(f, pos)
 	if err != nil {
 		return nil, false
 	}
@@ -1335,21 +1380,26 @@ func (s *Store) ReadRedo(lsn uint64) ([]byte, bool) {
 // ReadRedoRaw returns the raw framed record bytes (u32 length prefix +
 // framer body) for an lsn — what a business reader ships downstream.
 func (s *Store) ReadRedoRaw(lsn uint64) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	pos, ok := s.redoMap[lsn]
-	if !ok {
+	f := s.redoF
+	direct := s.directIO
+	if !ok || f == nil {
+		s.mu.RUnlock()
 		return nil, false
 	}
-	if s.directIO {
-		raw, err := readAtAligned(s.redoF, pos.off, pos.length)
+	s.redoIoMu.RLock()
+	s.mu.RUnlock()
+	defer s.redoIoMu.RUnlock()
+	if direct {
+		raw, err := readAtAligned(f, pos.off, pos.length)
 		if err != nil {
 			return nil, false
 		}
 		return raw[:pos.length], true
 	}
 	raw := make([]byte, pos.length)
-	if _, err := s.redoF.ReadAt(raw, pos.off); err != nil {
+	if _, err := f.ReadAt(raw, pos.off); err != nil {
 		return nil, false
 	}
 	return raw, true

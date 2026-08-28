@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 )
@@ -493,4 +495,192 @@ func TestRefIORingDual(t *testing.T) {
 			t.Fatalf("dual-chain reload GetLog(%d): %q, %v", i, l.Data, err)
 		}
 	}
+}
+
+// TestRefConcurrentReadWriteCompact: 12.14 读锁分离的 -race 回归 ——
+// apply 路径读(GetLog/GetLogRaw/ReadRedo*) 与 StoreLogs 追加、WriteRedoDirect
+// 直发、CompactRedo 换刀四路并发, 要求: 读到的信封要么完整解码且字节正确
+// (append-only 不可变保证), 要么 ErrLogNotFound(读尚未追加的尾部); 绝不撕裂、
+// 绝不 panic、绝不 EBADF。
+func TestRefConcurrentReadWriteCompact(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "logs"), Options{Mode: ModeRef, Codec: batchTestCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	payload := func(i uint64) []byte { return []byte(fmt.Sprintf("payload-%d", i)) }
+	envelope := func(i uint64) []byte {
+		return batchTestCodec{}.MergeSegments(0, []RedoSegment{{LSN: i, Payload: payload(i)}})
+	}
+	// 预热 64 条已绑定条目(读者的稳定读域)。
+	const pre = 64
+	for i := uint64(1); i <= pre; i++ {
+		if err := s.StoreLog(mkBatchEntry(i, RedoSegment{LSN: i, Payload: payload(i)})); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	errCh := make(chan error, 64)
+
+	// 写者: 继续追加已绑定条目(index/lsn 同步增长)。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := uint64(pre + 1)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.StoreLog(mkBatchEntry(i, RedoSegment{LSN: i, Payload: payload(i)})); err != nil {
+				select {
+				case errCh <- fmt.Errorf("StoreLog(%d): %w", i, err):
+				default:
+				}
+				return
+			}
+			i++
+		}
+	}()
+
+	// 直发者: 未绑定段(远高于绑定域的 LSN 区) + 已绑定段的幂等重发(去重命中)。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := uint64(1 << 40)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.WriteRedoDirect(i, i, payload(i)); err != nil {
+				select {
+				case errCh <- fmt.Errorf("WriteRedoDirect(%d): %w", i, err):
+				default:
+				}
+				return
+			}
+			i++
+			// 幂等重发一条已绑定段(完全相等 → 去重命中)。
+			n := (i % pre) + 1
+			if err := s.WriteRedoDirect(n, n, payload(n)); err != nil {
+				select {
+				case errCh <- fmt.Errorf("WriteRedoDirect-resend(%d): %w", n, err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	// 压实者: keepFrom=0(全保留)反复换刀 —— 专治"锁外读者 in-flight ReadAt
+	// 撞上旧 fd 被 close"的 EBADF/撕裂。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.CompactRedo(0); err != nil {
+				select {
+				case errCh <- fmt.Errorf("CompactRedo: %w", err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	// 读者×4: 已绑定域内 GetLog 必须字节正确; GetLogRaw/ReadRedo/ReadRedoRaw
+	// 抽样校验; 超过当前 lastIndex 的读允许 ErrLogNotFound。
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			var l raft.Log
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				last, err := s.LastIndex()
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("LastIndex: %w", err):
+					default:
+					}
+					return
+				}
+				idx := uint64(r)%pre + 1 // 恒在预热域内(已绑定, 压实保留)
+				if err := s.GetLog(idx, &l); err != nil {
+					select {
+					case errCh <- fmt.Errorf("GetLog(%d): %w", idx, err):
+					default:
+					}
+					return
+				}
+				if string(l.Data) != string(envelope(idx)) {
+					select {
+					case errCh <- fmt.Errorf("GetLog(%d) = %q, want %q", idx, l.Data, envelope(idx)):
+					default:
+					}
+					return
+				}
+				if _, err := s.GetLogRaw(idx); err != nil {
+					select {
+					case errCh <- fmt.Errorf("GetLogRaw(%d): %w", idx, err):
+					default:
+					}
+					return
+				}
+				if p, ok := s.ReadRedo(idx); !ok || string(p) != string(payload(idx)) {
+					select {
+					case errCh <- fmt.Errorf("ReadRedo(%d) ok=%v", idx, ok):
+					default:
+					}
+					return
+				}
+				if _, ok := s.ReadRedoRaw(idx); !ok {
+					select {
+					case errCh <- fmt.Errorf("ReadRedoRaw(%d) miss", idx):
+					default:
+					}
+					return
+				}
+				// 尾部的读: 允许成功或 ErrLogNotFound, 不允许其他错误。
+				var tl raft.Log
+				if err := s.GetLog(last + 1, &tl); err != nil && err != raft.ErrLogNotFound {
+					select {
+					case errCh <- fmt.Errorf("GetLog(tail %d): %w", last+1, err):
+					default:
+					}
+					return
+				}
+			}
+		}(r)
+	}
+
+	time.Sleep(3 * time.Second)
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	st := s.Stats()
+	if st.LastIndex < pre {
+		t.Fatalf("LastIndex regressed: %d", st.LastIndex)
+	}
+	t.Logf("lastIndex=%d redoEnd=%d", st.LastIndex, st.RedoEndOffset)
 }

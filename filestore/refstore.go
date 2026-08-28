@@ -424,10 +424,58 @@ func (s *Store) splitEntry(l *raft.Log) (uint64, []RedoSegment) {
 }
 
 // mergeEntry rebuilds Data for a redo entry from its segments.
+// 两阶段读锁分离(12.14): 位置+fd 抓拍在 RLock 内, 盘读/合并全部锁外
+// (redo.log append-only 不可变; redoIoMu.RLock 钉住 fd 防压实换刀时
+// 被 close)。调用方不持任何锁。
 func (s *Store) mergeEntry(base uint64, segLSNs []uint64) ([]byte, error) {
+	s.mu.RLock()
+	f, poss, err := s.pinRefReadLocked(segLSNs)
+	if err != nil {
+		return nil, err // pinRefReadLocked 失败路径已放 mu
+	}
+	defer s.redoIoMu.RUnlock()
+	return s.mergeCaptured(f, base, segLSNs, poss)
+}
+
+// captureRefReadLocked 在 mu(读或写)持有期间抓拍 segLSNs 的落点与 redoF
+// 身份 —— 同一临界区完成, 与 DeleteRange/CompactRedo 无 TOCTOU 窗口。
+func (s *Store) captureRefReadLocked(segLSNs []uint64) (*os.File, []redoPos, error) {
+	if s.redoF == nil {
+		return nil, nil, raft.ErrLogNotFound
+	}
+	poss := make([]redoPos, len(segLSNs))
+	for j, lsn := range segLSNs {
+		pos, ok := s.redoMap[lsn]
+		if !ok {
+			return nil, nil, raft.ErrLogNotFound
+		}
+		poss[j] = pos
+	}
+	return s.redoF, poss, nil
+}
+
+// pinRefReadLocked: 调用方持 mu.RLock; 成功返回时【mu 已放、redoIoMu.RLock
+// 已持】(调用方负责 redoIoMu.RUnlock)。必须持链移交(mu.RLock → redoIoMu.RLock
+// 不松手交接): 压实换刀需 mu.Lock+redoIoMu.Lock, 若先放 mu 再取 redoIoMu,
+// 压实在窗口内完成"换 fd+关旧 fd", 读者随后对已关闭 fd ReadAt(实测 EBADF)。
+// 失败路径自行放 mu 后返回。
+func (s *Store) pinRefReadLocked(segLSNs []uint64) (*os.File, []redoPos, error) {
+	f, poss, err := s.captureRefReadLocked(segLSNs)
+	if err != nil {
+		s.mu.RUnlock()
+		return nil, nil, err
+	}
+	s.redoIoMu.RLock()
+	s.mu.RUnlock()
+	return f, poss, nil
+}
+
+// mergeCaptured 在 redoIoMu.RLock 已持(钉住 fd)的前提下执行: 逐段 ReadAt +
+// Unframe, 再由 codec 合并为业务信封。全程不碰 mu。
+func (s *Store) mergeCaptured(f *os.File, base uint64, segLSNs []uint64, poss []redoPos) ([]byte, error) {
 	segs := make([]RedoSegment, len(segLSNs))
 	for j, lsn := range segLSNs {
-		payload, err := s.readRedoPayload(lsn)
+		payload, err := s.readRedoAt(f, poss[j])
 		if err != nil {
 			return nil, err
 		}
@@ -522,25 +570,34 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 }
 
 // readRedoPayload returns the payload bytes for an lsn via the presence map.
+// 调用方必须持有 mu(写锁)—— 供 storeLogsRef/WriteRedoDirect 的去重判定用
+// (写锁本身已排除压实换刀, fd 稳定)。锁外读盘场景走 mergeCaptured/ReadRedo。
 func (s *Store) readRedoPayload(lsn uint64) ([]byte, error) {
-	framer := s.opts.Framer
-	if framer == nil {
-		framer = StdFramer{}
-	}
 	pos, ok := s.redoMap[lsn]
 	if !ok {
 		return nil, raft.ErrLogNotFound
 	}
+	return s.readRedoAt(s.redoF, pos)
+}
+
+// readRedoAt 纯 I/O 半部: 从指定 fd 的 (off,len) 读记录并 Unframe。
+// 不带任何锁状态访问(s.opts/s.directIO 打开后不可变); fd 稳定性由调用方
+// 保证(mu.Lock 持有者, 或 redoIoMu.RLock 钉住的锁外读者)。
+func (s *Store) readRedoAt(f *os.File, pos redoPos) ([]byte, error) {
+	framer := s.opts.Framer
+	if framer == nil {
+		framer = StdFramer{}
+	}
 	var raw []byte
 	if s.directIO {
-		r, err := readAtAligned(s.redoF, pos.off, pos.length)
+		r, err := readAtAligned(f, pos.off, pos.length)
 		if err != nil {
 			return nil, err
 		}
 		raw = r
 	} else {
 		raw = make([]byte, pos.length)
-		if _, err := s.redoF.ReadAt(raw, pos.off); err != nil {
+		if _, err := f.ReadAt(raw, pos.off); err != nil {
 			return nil, err
 		}
 	}
@@ -679,10 +736,16 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 	if err != nil {
 		return err
 	}
-	_ = s.redoF.Close()
+	// 换刀临界区(mu.Lock + redoIoMu.Lock, 锁序一致): 等锁外读者在旧 fd 上的
+	// in-flight ReadAt 全部收工后再关旧 fd —— 抓拍 (fd,off,len) 的读者读的
+	// 是 append-only 不可变记录, 旧 inode 内容与新文件逐字节等价, 关 fd 才需互斥。
+	s.redoIoMu.Lock()
+	oldF := s.redoF
 	s.redoF = newF
 	s.redoMap = newMap
 	s.redoEnd = writeOff
+	_ = oldF.Close()
+	s.redoIoMu.Unlock()
 	return nil
 }
 

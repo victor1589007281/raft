@@ -304,10 +304,11 @@ func TestRaftRefPointerTier(t *testing.T) {
 	// 等全部 follower 应用
 	time.Sleep(2 * time.Second)
 	for i := 1; i < n; i++ {
-		if len(fsms[i].logs) == 0 {
+		applied := fsms[i].appliedLogs()
+		if len(applied) == 0 {
 			t.Fatalf("follower %d FSM got nothing", i)
 		}
-		got := fsms[i].logs[len(fsms[i].logs)-1]
+		got := applied[len(applied)-1]
 		if !bytes.Equal(got.Data, entryData) {
 			t.Fatalf("follower %d FSM data mismatch (%d vs %d bytes)", i, len(got.Data), len(entryData))
 		}
@@ -334,7 +335,7 @@ func TestRaftRefPointerTier(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	for i := 1; i < n; i++ {
 		found := false
-		for _, l := range fsms[i].logs {
+		for _, l := range fsms[i].appliedLogs() {
 			if bytes.Equal(l.Data, e2) {
 				found = true
 				break
@@ -358,6 +359,14 @@ func (m *mockFSM) Apply(l *raft.Log) interface{} {
 	m.logs = append(m.logs, l)
 	return nil
 }
+// appliedLogs 返回已应用日志快照(读方与 raft FSM goroutine 的 Apply 并发,
+// 必须经同一把 mu —— 直接读 m.logs 字段会被 -race 抓到)。
+func (m *mockFSM) appliedLogs() []*raft.Log {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]*raft.Log(nil), m.logs...)
+}
+
 func (m *mockFSM) Snapshot() (raft.FSMSnapshot, error) { return &mockSnap{}, nil }
 func (m *mockFSM) Restore(rc io.ReadCloser) error      { return rc.Close() }
 

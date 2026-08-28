@@ -119,8 +119,8 @@ const elideMinBytes = 128
 // big enough to matter goes out as a pointer copy — Data elided, Extensions
 // carries [base][lsns][dataLen][crc]. The original entry is untouched.
 func (s *Store) ElideLogData(l *raft.Log) (*raft.Log, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.format != "v2-ref" || s.opts.Codec == nil {
 		return nil, false
 	}
@@ -144,25 +144,46 @@ func (s *Store) ElideLogData(l *raft.Log) (*raft.Log, bool) {
 // ResolveElidedData implements raft.RedoByteResolver (follower side, P4):
 // rebuild the elided entry's Data from the local redo file by LSN. Any
 // missing segment → *raft.RedoDataMissingError (leader falls back to full
-// data for this follower).
+// data for this follower). 两阶段: 抓拍在 mu.RLock, 持链移交 redoIoMu.RLock
+// 后锁外读盘。
 func (s *Store) ResolveElidedData(ext []byte) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	m := raft.DecodeElideMarker(ext)
 	if m == nil {
 		return nil, errors.New("filestore: bad elide marker")
 	}
+	s.mu.RLock()
 	if s.format != "v2-ref" {
+		s.mu.RUnlock()
 		return nil, ErrNotRefMode
+	}
+	f, poss, err := s.pinRefReadLocked(m.LSNs)
+	if err != nil {
+		// mu 已放。逐段区分缺失 LSN(回执要带首个缺失段): 缺失 = redoMap 无此
+		// LSN(直发尚未到达), 由 leader 回退全量重发。
+		s.mu.RLock()
+		miss := uint64(0)
+		for _, lsn := range m.LSNs {
+			if _, ok := s.redoMap[lsn]; !ok {
+				miss = lsn
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if miss != 0 {
+			return nil, &raft.RedoDataMissingError{LSN: miss}
+		}
+		return nil, err
 	}
 	segs := make([]RedoSegment, len(m.LSNs))
 	for i, lsn := range m.LSNs {
-		payload, err := s.readRedoPayload(lsn)
-		if err != nil {
+		payload, rerr := s.readRedoAt(f, poss[i])
+		if rerr != nil {
+			s.redoIoMu.RUnlock()
 			return nil, &raft.RedoDataMissingError{LSN: lsn}
 		}
 		segs[i] = RedoSegment{LSN: lsn, Payload: payload}
 	}
+	s.redoIoMu.RUnlock()
 	var data []byte
 	if sc, ok := s.opts.Codec.(RedoSegmentCodec); ok {
 		data = sc.MergeSegments(m.Base, segs)
