@@ -37,79 +37,138 @@ var ErrUnboundFull = errors.New("filestore: unbound redo buffer full")
 // re-delivered is a no-op. The record is UNBOUND until a committed raft meta
 // entry references it — readers must gate on the committed frontier (LogDB's
 // FSM image does; ReadRedo is a presence-level API).
+//
+// 12.14 锁税根治(#19 lurch 引擎): 旧实现全程持 mu(含 WriteAt+fdatasync)——
+// 高直发速率下 follower 的 mu 被直发打满, raft AppendEntries 的 StoreLogs
+// 排不上 → 提交往返膨胀 → 计算层流水线截止重试 → 自激 lurch。现两阶段:
+// 锁内只做到位判定+偏移占位(纯内存), WriteAt+fdatasync 移出大锁
+// (append-only 不可变偏移; fdatasync 并发幂等安全), 发布后段再回锁内。
 func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.format != "v2-ref" || s.redoF == nil {
-		return ErrNotRefMode
-	}
-	if _, ok := s.redoMap[lsn]; ok {
-		// 与 storeLogsRef 同构的流快照语义: 同 LSN 重写 = 同一块的更新快照
-		// (块渐满扩展 / 块头 data_len 推进), 跨 epoch 脑裂已被 RPC fencing 拦截。
-		// 直发快照通常早于绑定快照, 故多数命中走"旧快照迟到 → 保留已存"。
-		existing, rerr := s.readRedoPayload(lsn)
-		if rerr == nil {
-			diff := firstDiffAt(existing, payload)
-			switch {
-			case diff == -1:
-				return nil // 完全相等: 幂等
-			case len(payload) <= len(existing) && (diff == len(payload) || diff < redoBlockHeaderLen):
-				return nil // 旧快照迟到(更短/同长): 保留已存的更新版本
-			case len(payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
-				// 更新快照: 落到下面重写
-			default:
-				if _, bound := s.lsnIndex[lsn]; bound {
-					return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容真分叉(firstDiff=%d existLen=%d newLen=%d) —— fencing", lsn, diff, len(existing), len(payload))
-				}
-				if s.opts.Logger != nil {
-					s.opts.Logger.Printf("[WARN] filestore: direct lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", lsn, len(existing), len(payload), diff)
+	// 压实换刀重试: 占位→锁外写→发布三阶段之间若 CompactRedo 换了 fd,
+	// 我的未发布记录不会被带进新文件(压实只搬 redoMap 已发布者) ——
+	// 发布前校验 fd 身份, 变了就以新 fd 重走全流程(去重判定在新 map 上重做)。
+	for attempt := 0; ; attempt++ {
+		if attempt >= 3 {
+			return fmt.Errorf("filestore: direct lsn=%d 连续撞上压实换刀, 放弃(由 raft 路径承载)", lsn)
+		}
+		// ---- 阶段 1(锁内): 模式/去重判定 + 偏移占位 + 未绑定水位记账 ----
+		s.mu.Lock()
+		if s.format != "v2-ref" || s.redoF == nil {
+			s.mu.Unlock()
+			return ErrNotRefMode
+		}
+		if _, ok := s.redoMap[lsn]; ok {
+			// 与 storeLogsRef 同构的流快照语义: 同 LSN 重写 = 同一块的更新快照
+			// (块渐满扩展 / 块头 data_len 推进), 跨 epoch 脑裂已被 RPC fencing 拦截。
+			// 直发快照通常早于绑定快照, 故多数命中走"旧快照迟到 → 保留已存"。
+			existing, rerr := s.readRedoPayload(lsn)
+			if rerr == nil {
+				diff := firstDiffAt(existing, payload)
+				switch {
+				case diff == -1:
+					s.mu.Unlock()
+					return nil // 完全相等: 幂等
+				case len(payload) <= len(existing) && (diff == len(payload) || diff < redoBlockHeaderLen):
+					s.mu.Unlock()
+					return nil // 旧快照迟到(更短/同长): 保留已存的更新版本
+				case len(payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
+					// 更新快照: 落到下面重写
+				default:
+					if _, bound := s.lsnIndex[lsn]; bound {
+						s.mu.Unlock()
+						return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容真分叉(firstDiff=%d existLen=%d newLen=%d) —— fencing", lsn, diff, len(existing), len(payload))
+					}
+					if s.opts.Logger != nil {
+						s.opts.Logger.Printf("[WARN] filestore: direct lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", lsn, len(existing), len(payload), diff)
+					}
 				}
 			}
 		}
-	}
-	framer := s.opts.Framer
-	if framer == nil {
-		framer = StdFramer{}
-	}
-	body := framer.Frame(base, lsn, payload)
-	recLen := 4 + len(body)
-	if s.opts.UnboundRedoLimit > 0 && s.unboundBytes+int64(recLen) > int64(s.opts.UnboundRedoLimit) {
-		return ErrUnboundFull
-	}
-	// One-record batch, 512B tail-padded (keeps the batch-boundary invariant).
-	buf := make([]byte, 4+len(body))
-	binary.LittleEndian.PutUint32(buf[:4], uint32(len(body)))
-	copy(buf[4:], body)
-	off := s.redoEnd
-	if pad := align512(int64(len(buf))) - int64(len(buf)); pad > 0 {
-		buf = append(buf, make([]byte, pad)...)
-	}
-	wbuf := buf
-	if s.directIO {
-		wbuf = alignedCopy(buf)
-	}
-	durable := false
-	if s.opts.IORing {
-		if err := storeLogsIORingChain(s.redoF, off, [][]byte{wbuf}, s.opts.IORingSQPoll); err == nil {
-			durable = true
+		framer := s.opts.Framer
+		if framer == nil {
+			framer = StdFramer{}
+		}
+		body := framer.Frame(base, lsn, payload)
+		recLen := 4 + len(body)
+		if s.opts.UnboundRedoLimit > 0 && s.unboundBytes+int64(recLen) > int64(s.opts.UnboundRedoLimit) {
+			s.mu.Unlock()
+			return ErrUnboundFull
+		}
+		// One-record batch, 512B tail-padded (keeps the batch-boundary invariant).
+		buf := make([]byte, 4+len(body))
+		binary.LittleEndian.PutUint32(buf[:4], uint32(len(body)))
+		copy(buf[4:], body)
+		// 偏移占位: 立即推进 redoEnd(并发直发各自拿到互异区间), 记账同步预留。
+		off := s.redoEnd
+		if pad := align512(int64(len(buf))) - int64(len(buf)); pad > 0 {
+			buf = append(buf, make([]byte, pad)...)
+		}
+		s.redoEnd = off + align512(int64(len(buf)))
+		s.unboundBytes += int64(recLen)
+		f := s.redoF
+		// 持链移交(与 pinRefReadLocked 同构): 仍持 mu 时取 redoIoMu.RLock ——
+		// 压实换刀需 mu.Lock+redoIoMu.Lock, 此移交令换刀绝不可能在我的
+		// WriteAt 前完成 close(否则会 EBADF —— -race 烤机实测抓获)。
+		s.redoIoMu.RLock()
+		s.mu.Unlock()
+
+		rollbackReservation := func() {
+			s.mu.Lock()
+			s.unboundBytes -= int64(recLen)
+			if s.unboundBytes < 0 {
+				s.unboundBytes = 0
+			}
+			s.mu.Unlock()
+		}
+
+		// ---- 阶段 2(redoIoMu.RLock 内, 阶段 1 已持链移交): 写盘 + 屏障 ——
+		// 钉住 fd 防压实换刀中途 close; append-only 不可变偏移, fdatasync 并发幂等安全。
+		wbuf := buf
+		if s.directIO {
+			wbuf = alignedCopy(buf)
+		}
+		durable := false
+		usedIORing := false
+		var werr error
+		if s.opts.IORing {
+			if err := storeLogsIORingChain(f, off, [][]byte{wbuf}, s.opts.IORingSQPoll); err == nil {
+				durable = true
+				usedIORing = true
+			}
+		}
+		if !durable {
+			if _, err := f.WriteAt(wbuf, off); err != nil {
+				werr = err
+			} else if err := s.barrierOn(f); err != nil {
+				werr = err
+			}
+		}
+		s.redoIoMu.RUnlock()
+		if werr != nil {
+			rollbackReservation() // 占位区间留零填充洞, 扫描器按批尾填充跳过
+			return werr
+		}
+
+		// ---- 阶段 3(锁内): 发布映射; fd 已被压实换掉则整体重来 ----
+		s.mu.Lock()
+		if s.redoF != f {
+			s.unboundBytes -= int64(recLen)
+			if s.unboundBytes < 0 {
+				s.unboundBytes = 0
+			}
+			s.mu.Unlock()
+			continue // 压实把未发布记录留在旧 inode —— 必须以新 fd 重写
+		}
+		if usedIORing {
 			s.ioringOK++
 		}
-	}
-	if !durable {
-		if _, err := s.redoF.WriteAt(wbuf, off); err != nil {
-			return err
+		if s.redoMap == nil {
+			s.redoMap = make(map[uint64]redoPos)
 		}
-		if err := s.barrierOn(s.redoF); err != nil {
-			return err
-		}
+		s.redoMap[lsn] = redoPos{off: off, length: recLen}
+		s.mu.Unlock()
+		return nil
 	}
-	if s.redoMap == nil {
-		s.redoMap = make(map[uint64]redoPos)
-	}
-	s.redoMap[lsn] = redoPos{off: off, length: recLen}
-	s.redoEnd = off + align512(int64(len(buf)))
-	s.unboundBytes += int64(recLen)
-	return nil
 }
 
 // elideMinBytes: don't bother eliding tiny entries (marker ≈ 24B+8B/lsn).

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -548,36 +549,46 @@ func TestRefConcurrentReadWriteCompact(t *testing.T) {
 		}
 	}()
 
-	// 直发者: 未绑定段(远高于绑定域的 LSN 区) + 已绑定段的幂等重发(去重命中)。
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		i := uint64(1 << 40)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if err := s.WriteRedoDirect(i, i, payload(i)); err != nil {
+	// 直发者×2(同一 LSN 空间并发对抗: 两写者交错写同一批未绑定 LSN,
+	// 验两阶段直发的占位/发布/幂等在并发下同 LSN 不撕裂不报错):
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(seed uint64) {
+			defer wg.Done()
+			i := uint64(1 << 40)
+			for {
 				select {
-				case errCh <- fmt.Errorf("WriteRedoDirect(%d): %w", i, err):
+				case <-stop:
+					return
 				default:
 				}
-				return
-			}
-			i++
-			// 幂等重发一条已绑定段(完全相等 → 去重命中)。
-			n := (i % pre) + 1
-			if err := s.WriteRedoDirect(n, n, payload(n)); err != nil {
-				select {
-				case errCh <- fmt.Errorf("WriteRedoDirect-resend(%d): %w", n, err):
-				default:
+				// 两个写者共用同一 LSN 序列(同字节幂等语义) —— 同 LSN 并发
+				// 双写允许落两次(后发布者赢 map, 字节一致), 绝不可报错/撕裂。
+				if err := s.WriteRedoDirect(i, i, payload(i)); err != nil {
+					// "连续撞上压实换刀"是设计性回退(由 raft 路径承载该段):
+					// 本测试的压实器是敌对级紧循环, 直发持续撞窗属预期; 容忍之。
+					if strings.Contains(err.Error(), "压实换刀") {
+						continue
+					}
+					select {
+					case errCh <- fmt.Errorf("WriteRedoDirect(w%d, %d): %w", seed, i, err):
+					default:
+					}
+					return
 				}
-				return
+				i++
+				// 幂等重发一条已绑定段(完全相等 → 去重命中)。
+				n := (i % pre) + 1
+				if err := s.WriteRedoDirect(n, n, payload(n)); err != nil {
+					select {
+					case errCh <- fmt.Errorf("WriteRedoDirect-resend(w%d, %d): %w", seed, n, err):
+					default:
+					}
+					return
+				}
 			}
-		}
-	}()
+		}(uint64(w))
+	}
 
 	// 压实者: keepFrom=0(全保留)反复换刀 —— 专治"锁外读者 in-flight ReadAt
 	// 撞上旧 fd 被 close"的 EBADF/撕裂。
