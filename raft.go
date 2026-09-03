@@ -1705,7 +1705,13 @@ func (r *Raft) persistAsyncBatch(w asyncWrite) {
 		r.dropPendingThrough(w.lastIndex)
 		return
 	}
-	if err := r.logs.StoreLogs(w.logs); err != nil {
+	// 12.14.8 #19 取证: 拆"排队+合并等待"(既有 logStore 自 w.start=dispatch 起算)与
+	// "纯写盘"(logStoreWrite 紧贴 StoreLogs) —— lurch 期间若前者膨胀而后者平坦,
+	// 卡点在 async 写者串行队列; 同步膨胀则卡点在盘。
+	writeStart := time.Now()
+	err := r.logs.StoreLogs(w.logs)
+	metrics.MeasureSince([]string{"raft", "leader", "logStoreWrite"}, writeStart)
+	if err != nil {
 		metrics.MeasureSince([]string{"raft", "leader", "logStore", "error"}, w.start)
 		r.logger.Error("failed to commit logs asynchronously", "error", err)
 		r.asyncWriteFailed.Store(true)
@@ -2011,6 +2017,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			// Resolution restores Data in memory; the stored entry is complete
 			// again (stores that can't resolve → reject, never silently store a
 			// Data-less entry).
+			resolveStart := time.Now() // 12.14.8: 指针解析耗时单列(#19 取证: ref 读盘是否挤兑)
 			if missIdx, err := resolveElidedEntries(r.logs, newEntries); err != nil {
 				r.logger.Warn("cannot resolve elided redo entries locally; asking leader for full data",
 					"from_index", missIdx, "error", err)
@@ -2018,14 +2025,17 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 				resp.NoRetryBackoff = true
 				return
 			}
+			metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "resolveElided"}, resolveStart)
 
 			// Append the new entries
+			storeStart := time.Now() // 12.14.8: 纯落盘拆分(既有 storeLogs 口径含冲突检测+解析)
 			if err := r.logs.StoreLogs(newEntries); err != nil {
 				r.logger.Error("failed to append to logs", "error", err)
 				// TODO: leaving r.getLastLog() in the wrong
 				// state if there was a truncation above
 				return
 			}
+			metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogsOnly"}, storeStart)
 
 			// Handle any new configuration changes
 			for _, newEntry := range newEntries {
