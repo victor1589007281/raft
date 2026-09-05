@@ -200,53 +200,103 @@ type redoPos struct {
 // errScanStop is the internal sentinel for torn/corrupt tails in scanRecords.
 var errScanStop = errors.New("filestore: torn tail")
 
+// scanStats accumulates what scanRecords observed beyond the good tail.
+// #163 W4: hole healing needs to know how many bytes it skipped and whether
+// the skip was a tolerated hole (healed) or the end of data.
+type scanStats struct {
+	holes      int   // tolerated 512 对齐零洞个数(见下方判别式)
+	holesBytes int64 // bytes covered by tolerated skips
+}
+
 // scanRecords walks [u32 len][body] records starting at start. When
 // padBatches (v2 formats), a zero length at a record boundary is batch-tail
-// padding: skip to the next 512B boundary once (off advances even on break so
-// endOff stays batch-aligned); a second consecutive zero = end of data.
-// yield returns errScanStop to end the scan at a torn/corrupt record.
-// Returns the end of good data (the next append position).
-func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64, body []byte) error) (int64, error) {
+// padding: skip to the next 512B boundary (off advances even on break so
+// endOff stays batch-aligned); zeros running to EOF = end of data.
+//
+// #163 W4 行级根修(孔洞容忍): WriteRedoDirect 二阶段写失败回滚只退记账、不退
+// redoEnd 指针, 在 redo.log 中留下 512 对齐的零洞; 并发乱序发布可令洞先于
+// 已发布记录落位。旧扫描的"两个连续零段 = 数据终点"启发式在真实 #163 指纹
+// (批尾填充零段 + 紧邻孔洞零段 = 貌似两个连续零段, 但后面还有活记录)下
+// 依旧提前 break → 引用洞后字节的一切已提交 meta 丢光(cascade truncate)
+// → GetLog not-found → commit=0 死锁家族。现改为逐 512 块判定:
+//   - 零块向后推进, 直到遇到非零块头(可能是有记录也可能是垃圾)或 EOF;
+//   - 非零块头交给 yield/调用方解码: 合法记录 = 孔洞被治愈(stats.holes++),
+//     解码失败(errScanStop) = 撕尾, 停在洞后第一个垃圾块头 —— 与旧
+//     torn-tail 语义一致;
+//   - 零块一路到 EOF = 批尾填充, 数据终点(批对齐不变量保留)。
+// 返回好数据终点(下一追加位置)。
+func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64, body []byte) error) (int64, scanStats, error) {
 	buf := bytes.NewReader(raw[start:])
 	off := start
-	zeroRun := 0
+	var stats scanStats
+	zeroStart := int64(-1) // 最近一次跳过零区的起始偏移(-1 = 无)
+	pendingZero := int64(0) // 最近一次跳过的零块字节数(可能是填充也可能是孔洞)
 	for {
 		var lenBuf [4]byte
 		if _, err := io.ReadFull(buf, lenBuf[:]); err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		} else if err != nil {
-			return off, err
+			return off, stats, err
 		}
 		n := int64(binary.LittleEndian.Uint32(lenBuf[:]))
 		if n <= 0 {
-			zeroRun++
-			if padBatches && zeroRun == 1 {
-				next := align512(off)
-				off = next
-				if next >= int64(len(raw)) {
-					break
-				}
-				if _, err := buf.Seek(next-start, io.SeekStart); err != nil {
-					return off, err
-				}
-				continue
+			// 洞/批尾填充只认 512 对齐形态(本格式一切记录与洞都是 512 对齐的);
+			// 不对齐的零 = 未知格式, 保持旧语义(终点)。终点停在批边界(可能
+			// 越过 EOF —— redoEnd 恒 512 对齐的不变量必须保)。
+			if !padBatches {
+				break
 			}
-			break
+			next := align512(off)
+			pendingZero = next - off
+			if zeroStart < 0 {
+				zeroStart = off
+			}
+			off = next
+			// 零块向后推进: 跳过连续零块, 直到非零块头/EOF。
+			for off+4 <= int64(len(raw)) {
+				if binary.LittleEndian.Uint32(raw[off:off+4]) != 0 {
+					break // 洞后出现非零块头: 可能是记录也可能是垃圾, 交外层判定
+				}
+				pendingZero += 512
+				off += 512
+			}
+			if off+4 > int64(len(raw)) {
+				// 零块一路到 EOF: 批尾填充, 数据终点。若 raw 长度不是 512 的
+				// 倍数(截断的洞), 停在最后一个完整块边界。
+				break
+			}
+			if _, err := buf.Seek(off-start, io.SeekStart); err != nil {
+				return off, stats, err
+			}
+			continue
 		}
-		zeroRun = 0
+		if pendingZero > 0 {
+			// 零区之后跟的是记录 = 填充或孔洞被确认。判别式: 批尾填充是
+			// 【部分槽】(记录尾字节之后到槽边, < 512 且起始偏移非 512 对齐);
+			// WriteRedoDirect 回滚洞是【整段保留槽】(redoEnd 原本就 512 对齐,
+			// 整段零) —— 零区起始落在 512 边界, 或涵盖至少一个完整 512 块。
+			if zeroStart%512 == 0 || pendingZero >= 512 {
+				stats.holes++
+				stats.holesBytes += pendingZero
+			}
+			pendingZero = 0
+			zeroStart = -1
+		}
 		body := make([]byte, n)
 		if _, err := io.ReadFull(buf, body); err != nil {
 			break // crash-truncated tail
 		}
 		if err := yield(off, body); err != nil {
 			if err == errScanStop {
+				// 撕尾/垃圾: 停在洞后第一个坏块头之前(off 已含洞), 截断语义
+				// 与旧实现一致(下一追加从 good end 覆盖)。
 				break
 			}
-			return off, err
+			return off, stats, err
 		}
 		off += 4 + n
 	}
-	return off, nil
+	return off, stats, nil
 }
 
 // Store is an append-only file-backed raft.LogStore.
@@ -286,6 +336,10 @@ type Store struct {
 	ioringOK uint64            // io_uring chains actually completed (probe evidence)
 
 	unboundBytes int64 // P3: direct-written bytes not yet bound by raft meta
+
+	// #163 W4 孔洞观测: reloadRef 越过的 512 对齐零洞计数与字节数(进程累计)。
+	redoHealedHoles uint64
+	redoHoleBytes   int64
 }
 
 var _ raft.LogStore = (*Store)(nil)
@@ -661,7 +715,7 @@ func (s *Store) reload() error {
 	}
 
 	padBatches := s.format == "v2-singlewal"
-	goodEnd, err := scanRecords(raw, start, padBatches, func(off int64, body []byte) error {
+	goodEnd, _, err := scanRecords(raw, start, padBatches, func(off int64, body []byte) error {
 		var l *raft.Log
 		var lsn uint64
 		var derr error
@@ -1327,22 +1381,27 @@ type Stats struct {
 	IORing        bool   `json:"ioRing"`
 	IORingOK      uint64 `json:"ioRingOK"` // chains actually completed (probe evidence)
 	DirectIO      bool   `json:"directIO"`
+
+	RedoHealedHoles uint64 `json:"redoHealedHoles,omitempty"` // #163: zero holes skipped on reload
+	RedoHoleBytes   int64  `json:"redoHoleBytes,omitempty"`   // #163: bytes covered by healed holes
 }
 
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return Stats{
-		Format:        s.format,
-		SparseIndex:   s.opts.SparseIndex,
-		LSNEntries:    len(s.lsnIndex),
-		FirstIndex:    s.first,
-		LastIndex:     s.lastIndexLocked(),
-		EndOffset:     s.endOff,
-		RedoEndOffset: s.redoEnd,
-		IORing:        s.opts.IORing,
-		IORingOK:      s.ioringOK,
-		DirectIO:      s.directIO,
+		Format:          s.format,
+		SparseIndex:     s.opts.SparseIndex,
+		LSNEntries:      len(s.lsnIndex),
+		FirstIndex:      s.first,
+		LastIndex:       s.lastIndexLocked(),
+		EndOffset:       s.endOff,
+		RedoEndOffset:   s.redoEnd,
+		IORing:          s.opts.IORing,
+		IORingOK:        s.ioringOK,
+		DirectIO:        s.directIO,
+		RedoHealedHoles: s.redoHealedHoles,
+		RedoHoleBytes:   s.redoHoleBytes,
 	}
 }
 

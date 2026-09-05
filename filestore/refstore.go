@@ -495,6 +495,13 @@ func (s *Store) mergeCaptured(f *os.File, base uint64, segLSNs []uint64, poss []
 
 // reloadRef scans redo.log (data authority) then raft.log (meta), dropping
 // meta entries whose redo bytes were torn away.
+//
+// #163 W4 行级根修: redo 扫描现在容忍 512 对齐零洞(WriteRedoDirect 二阶段
+// 失败回滚留下的占位区间, 可能先于并发已发布记录落位)。旧实现遇洞即
+// errScanStop → redoGood 缩短 → 引用洞后字节的已提交 meta 全部误判为
+// "redo 被撕走" → truncateAtGapLocked 级联截断 → 已提交条目不可达 →
+// commit=0 死锁。现洞后出现 CRC 合法记录则继续收集, 洞只是被跳过。
+// 未被任何 meta 引用的洞(孤零洞)由 CompactRedo 顺带收走。
 func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	framer := s.opts.Framer
 	if framer == nil {
@@ -503,7 +510,8 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	// 1. redo scan: build the lsn→(off,len) presence map, find the good tail.
 	redoGood := int64(fileHeaderLen)
 	if len(rawRedo) >= fileHeaderLen {
-		redoGood, _ = scanRecords(rawRedo, fileHeaderLen, true, func(off int64, body []byte) error {
+		var redoStats scanStats
+		redoGood, redoStats, _ = scanRecords(rawRedo, fileHeaderLen, true, func(off int64, body []byte) error {
 			_, lsn, _, err := framer.Unframe(body)
 			if err != nil {
 				return errScanStop // torn/corrupt redo tail
@@ -514,9 +522,17 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 			s.redoMap[lsn] = redoPos{off: off, length: 4 + len(body)}
 			return nil
 		})
+		if redoStats.holes > 0 {
+			s.redoHealedHoles += uint64(redoStats.holes)
+			s.redoHoleBytes += redoStats.holesBytes
+			if s.opts.Logger != nil {
+				s.opts.Logger.Printf("[WARN] filestore: %s redo 重载越过 %d 个 512 对齐零洞(%d B) —— #163 孔洞容忍(WriteRedoDirect 回滚残留), 记录完好不截断",
+					s.path, redoStats.holes, redoStats.holesBytes)
+			}
+		}
 	}
 	// 2. meta scan: rebuild logs; drop entries referencing torn redo bytes.
-	metaGood, err := scanRecords(rawMeta, fileHeaderLen, true, func(off int64, body []byte) error {
+	metaGood, _, err := scanRecords(rawMeta, fileHeaderLen, true, func(off int64, body []byte) error {
 		h, tail, err := decodeMetaRecord(body)
 		if err != nil {
 			return errScanStop

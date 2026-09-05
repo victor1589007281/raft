@@ -287,6 +287,7 @@ func TestRefTornMeta(t *testing.T) {
 }
 
 // TestRefBatchAlignment: both files keep 512-aligned batch boundaries.
+// TestRefBatchAlignment: every batch leaves both files 512-aligned.
 func TestRefBatchAlignment(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "logs"), refOpts())
@@ -300,6 +301,107 @@ func TestRefBatchAlignment(t *testing.T) {
 			t.Fatalf("batch %d: meta=%d redo=%d not aligned", b, st.EndOffset, st.RedoEndOffset)
 		}
 		s.StoreLog(&raft.Log{Index: uint64(b + 1), Term: 1, Type: raft.LogCommand, Data: []byte("align-me")})
+	}
+}
+
+// TestRefRedoHoleHeal (#163 W4 行级根修回归): WriteRedoDirect 二阶段写失败
+// 回滚只退记账不退 redoEnd, 在 redo.log 留下【未绑定】的 512 对齐零洞 ——
+// 没有任何 meta 引用洞内字节; 同一 lsn 的重试记录在洞后落位(乱序发布:
+// 洞先于后来成功的记录)。旧扫描在洞处 break → redoGood 缩短 → 引用洞后
+// 字节的已提交 meta 全部级联截断 → GetLog not-found → commit=0 死锁。
+// 现要求: 重载越过零洞, 全部已提交 meta 保留, GetLog/ReadRedo 完整,
+// redoEnd 保持批对齐, Stats 记录 healed holes。
+//
+// 磁盘指纹(与真实 #163 同构):
+//   - 洞在 slot 1024(未绑定, 无 meta 指向它);
+//   - lsn=2 的重试记录(同 payload)在洞后 2560 槽(原 4 条占用 512..2560,
+//     洞后 1536/2048 是已发布的 lsn 3/4);
+//   - meta 1..4 全部引用【完好】的 redo 字节 —— 语义分界: 洞落在未绑定
+//     空间 = 治愈; 洞落在已提交数据 = meta 级联截断(TestRefTornRedo 已覆盖)。
+func TestRefRedoHoleHeal(t *testing.T) {
+	dir := t.TempDir()
+	lp := filepath.Join(dir, "logs")
+	s, err := Open(lp, refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 4 个 redo 条目(每批 512 对齐): 记录位于 512/1024/1536/2048 槽。
+	for i := uint64(1); i <= 4; i++ {
+		if err := s.StoreLog(&raft.Log{Index: i, Term: 1, Type: raft.LogCommand, Data: []byte(fmt.Sprintf("t%d", i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	// 复刻 #163 磁盘指纹(WriteRedoDirect 失败回滚 + 同 lsn 重试落位):
+	// 1) 把第 2 条(1024 槽)抹成零洞 —— 该 lsn 的直发占位被回滚, redoMap
+	//    从未发布过它, 但已提交 meta(经 raft 路径晚一步绑定)引用的位置是
+	//    它【后来重试落位的槽】, 不是这个洞;
+	// 2) 在 redo 末尾(2560 槽)追加 lsn=2 的重试记录(同 payload, 512 对齐)
+	//    —— meta-2 引用这个位置。
+	// 洞后 1536/2048 的 lsn 3/4 原样保留(乱序发布形态), meta 不动。
+	redoPath := filepath.Join(lp, redoFileName)
+	f, err := os.OpenFile(redoPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hole := make([]byte, 512)
+	if _, err := f.WriteAt(hole, fileHeaderLen+512); err != nil {
+		t.Fatal(err)
+	}
+	holeOff := int64(fileHeaderLen) + 4*512 // 2560: 第 5 槽 = 重试落位点
+	body := StdFramer{}.Frame(0, 2, []byte("t2"))
+	rec := make([]byte, 4+len(body))
+	binary.LittleEndian.PutUint32(rec[:4], uint32(len(body)))
+	copy(rec[4:], body)
+	if pad := align512(int64(len(rec))) - int64(len(rec)); pad > 0 {
+		rec = append(rec, make([]byte, pad)...)
+	}
+	if _, err := f.WriteAt(rec, holeOff); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s2, err := Open(lp, refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	// 关键判据: 已提交 meta 不再被级联截断 —— lastIndex 仍为 4。
+	last, _ := s2.LastIndex()
+	if last != 4 {
+		t.Fatalf("last = %d, hole-tolerant reload must keep all committed meta (want 4)", last)
+	}
+	for i := uint64(1); i <= 4; i++ {
+		var l raft.Log
+		if err := s2.GetLog(i, &l); err != nil || len(l.Data) == 0 {
+			t.Fatalf("GetLog(%d) after hole heal: %v", i, err)
+		}
+	}
+	// lsn=2 经重试记录可读(重试在洞后, 被孔洞容忍收进 redoMap);
+	// lsn 3/4 完好。
+	if p, ok := s2.ReadRedo(2); !ok || string(p) != "t2" {
+		t.Fatalf("ReadRedo(2) = %q,%v, retry record must heal", p, ok)
+	}
+	for i := uint64(3); i <= 4; i++ {
+		if p, ok := s2.ReadRedo(i); !ok || string(p) != fmt.Sprintf("t%d", i) {
+			t.Fatalf("ReadRedo(%d) = %q,%v", i, p, ok)
+		}
+	}
+	st := s2.Stats()
+	if st.RedoHealedHoles == 0 {
+		t.Fatalf("RedoHealedHoles = 0, want >=1 (slot hole healed)")
+	}
+	if st.RedoEndOffset%512 != 0 {
+		t.Fatalf("RedoEndOffset = %d, must stay 512-aligned", st.RedoEndOffset)
+	}
+	// 追加继续从批边界开始且可读。
+	if err := s2.StoreLog(&raft.Log{Index: 5, Term: 1, Type: raft.LogCommand, Data: []byte("t5")}); err != nil {
+		t.Fatal(err)
+	}
+	var l5 raft.Log
+	if err := s2.GetLog(5, &l5); err != nil || string(l5.Data) != "t5" {
+		t.Fatalf("append after heal: %q, %v", l5.Data, err)
 	}
 }
 

@@ -646,10 +646,40 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, err
 	}
 
-	// Scan through the log for any configuration change entries.
+	// 12.14.9 #163 自愈(lastLog 幻影校验): lastLog 幻影 = stable/内存态声称的
+	// 尾条目在 log store 中不可连续读取。来源: filestore reloadRef 级联截断后
+	// endOff 之上的 meta 仍在(或领导者异步持久化尾丢), lastLog 被 setLastLog
+	// 抬高到 store 读不到的高度 → appendEntries prev-log 检查(r.lastLog)始终
+	// 拒绝/错配, 领导者永不自我截断 → 复制卡死 → commit=0 死锁家族。旧实现
+	// 只在下方的配置扫描 panic 里暴露(重启后必炸)。现改为: 校验
+	// [max(snapshot,lastApplied)+1, lastIndex] 连续可读; 幻影处截断 store 到
+	// 最高连续可读位并大声告警 —— 截断后的条目由领导者按 prevLog 重铺(与
+	// follower 冲突截断同构), 本节点从死锁源头变为可自愈。
 	snapshotIndex, _ := r.getLastSnapshot()
 	lastappliedIndex := r.getLastApplied()
-	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
+	scanFrom := max(snapshotIndex, lastappliedIndex) + 1
+	goodLast, phantomErr := verifyLogTailContiguous(r.logs, lastLog.Index, scanFrom)
+	if phantomErr != nil {
+		r.logger.Warn("#163 lastLog 幻影校验失败 —— 截断 log store 到最高连续可读位(等领导者重铺)",
+			"claimedLastIndex", lastLog.Index,
+			"truncatedTo", goodLast,
+			"scanFrom", scanFrom,
+			"error", phantomErr)
+		if truncErr := r.logs.DeleteRange(goodLast+1, lastLog.Index); truncErr != nil {
+			return nil, fmt.Errorf("failed to truncate phantom log tail (%v): %w", phantomErr, truncErr)
+		}
+		lastLog = Log{}
+		if goodLast > 0 {
+			if err := r.logs.GetLog(goodLast, &lastLog); err != nil {
+				return nil, fmt.Errorf("failed to get log after phantom truncation at %d: %v", goodLast, err)
+			}
+		}
+		// 同步内存态: setLastLog 降到真实可读高度, 消除 prev-log 检查的幻影。
+		r.setLastLog(lastLog.Index, lastLog.Term)
+	}
+
+	// Scan through the log for any configuration change entries.
+	for index := scanFrom; index <= lastLog.Index; index++ {
 		var entry Log
 		if err := r.logs.GetLog(index, &entry); err != nil {
 			r.logger.Error("failed to get log", "index", index, "error", err)
@@ -676,6 +706,29 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	r.goFunc(r.runFSM)
 	r.goFunc(r.runSnapshots)
 	return r, nil
+}
+
+// verifyLogTailContiguous checks that [from, lastIndex] is contiguous and
+// readable in the log store (12.14.9 #163 lastLog 幻影校验). Returns the
+// highest contiguous readable index (≥ from-1) and, if lastIndex itself is
+// unreachable, the error at the break point. A nil error means the whole
+// range is readable. Cost is one GetLog per entry in the range — at startup
+// this is bounded by the unapplied tail, and the config scan below walks the
+// same range anyway.
+func verifyLogTailContiguous(logs LogStore, lastIndex, from uint64) (uint64, error) {
+	if lastIndex == 0 || from > lastIndex {
+		return lastIndex, nil
+	}
+	if from < 1 {
+		from = 1
+	}
+	var entry Log
+	for index := from; index <= lastIndex; index++ {
+		if err := logs.GetLog(index, &entry); err != nil {
+			return index - 1, err
+		}
+	}
+	return lastIndex, nil
 }
 
 // restoreSnapshot attempts to restore the latest snapshots, and fails if none
