@@ -336,10 +336,25 @@ type Store struct {
 	ioringOK uint64            // io_uring chains actually completed (probe evidence)
 
 	unboundBytes int64 // P3: direct-written bytes not yet bound by raft meta
+	// J5 泄漏修复(9.24): 每条直发预留的 per-LSN 台账。同 LSN 的块渐满重写
+	// (InnoDB 512B 块随填充重发)与快照演化会产生多代预留, 旧的 bound-keep /
+	// stale-keep / rewrite 分支必须释放被替代的那代, 否则水位虚高单调涨满
+	// UnboundRedoLimit → 直发通道永久背压(K6 实测 60% 预留泄漏, 268MiB 钉死)。
+	// 键=LSN, 值=该 LSN 当前存活预留(可有多代并存? 不: 重写即替代, 每 LSN
+	// 至多一条存活预留 + 一条待发布预留 —— 均以 recLen 累计于此)。
+	unboundPending map[uint64]int64
 
 	// #163 W4 孔洞观测: reloadRef 越过的 512 对齐零洞计数与字节数(进程累计)。
 	redoHealedHoles uint64
 	redoHoleBytes   int64
+
+	// J5 绑定速率观测(进程累计): directRedoSegs = WriteRedoDirect 成功发布
+	// 的段数; boundRedoSegs/BoundBytes = raft meta 首次建 lsnIndex 引用的段数/
+	// 字节数(绑定时刻)。Δbind/Δt 即「绑定 segs/s」—— J5 多 raft 组立项判据
+	// 挂它的实测饱和点, 不挂 tps。
+	directRedoSegs uint64
+	boundRedoSegs  uint64
+	boundRedoBytes int64
 }
 
 var _ raft.LogStore = (*Store)(nil)
@@ -795,6 +810,9 @@ func (s *Store) truncateAtGapLocked() bool {
 				}
 			}
 		}
+		// J5 泄漏修复(9.24): 此处不动台账 —— 被截掉的 lsn 在绑定时刻已整条
+		// 清账; 截断前如有直发重发(重新挂账), 该记录仍是盘上真实未绑定字节,
+		// 台账正确保留, 由 CompactRedo 回收其字节时一并清账。
 		return true
 	}
 	return false
@@ -1384,6 +1402,73 @@ type Stats struct {
 
 	RedoHealedHoles uint64 `json:"redoHealedHoles,omitempty"` // #163: zero holes skipped on reload
 	RedoHoleBytes   int64  `json:"redoHoleBytes,omitempty"`   // #163: bytes covered by healed holes
+
+	// J5 绑定速率观测(进程累计计数, 速率由读方取窗口差分)。
+	RedoDirectSegs  uint64 `json:"redoDirectSegs,omitempty"`  // WriteRedoDirect 成功发布段数
+	RedoBoundSegs   uint64 `json:"redoBoundSegs,omitempty"`   // raft meta 首次绑定段数(建 lsnIndex 时刻)
+	RedoBoundBytes  int64  `json:"redoBoundBytes,omitempty"`  // 绑定段承载的负载字节数
+	RedoUnboundBytes int64 `json:"redoUnboundBytes,omitempty"` // P3 未绑定水位(当前值 gauge)
+}
+
+// J5 泄漏修复(9.24): 未绑定水位的配对记账。生命周期按事件驱动:
+//   ① reserve(lsn, n): WriteRedoDirect 阶段1 每次"新代"预留登记(直发重写
+//     场景同 LSN 多代共存, 各代各自挂账, 现金是全部代之和)。
+//   ② 终点事件即清账: 绑定(storeLogsRef 建 lsnIndex)、重写替代(direct/
+//     storeLogsRef 发布新代前)、压实丢弃(lsn<keepFrom) —— 任一终点发生
+//     即 unboundDrain 整条清账(旧代+新代), 后续再投递 no-op。
+//   ③ 失败即回滚: 占位/写盘失败按本次预留量 unboundRelease 退还。
+//   不变式: 现金 unboundBytes 恒 = Σ台账, Stats 照旧读现金。
+// 台账随进程存亡: reloadRef 从 redo 扫描重建(等价于把盘上未绑定记录重新
+// reserve); DeleteRange 清 lsnIndex 时一并清台账; CompactRedo 换 map 时
+// 同步清掉丢弃者的台账。
+func (s *Store) unboundReserve(lsn uint64, n int64) {
+	if n <= 0 {
+		return
+	}
+	if s.unboundPending == nil {
+		s.unboundPending = make(map[uint64]int64)
+	}
+	s.unboundPending[lsn] += n
+	s.unboundBytes += n
+}
+
+// unboundRelease 释放至多 n 字节。台账不存在(已绑定后的重发、raft 原生段
+// 的绑定、压实后的残留分支)整体 no-op —— 防双扣的唯一闸门: 现金扣减只在
+// 有台账时发生, K6 实测的 9443 次 bound=true 重写再投递在这里被吸收。
+func (s *Store) unboundRelease(lsn uint64, n int64) {
+	if n <= 0 {
+		return
+	}
+	p, ok := s.unboundPending[lsn]
+	if !ok {
+		return
+	}
+	if p > n {
+		s.unboundPending[lsn] = p - n
+	} else {
+		delete(s.unboundPending, lsn)
+	}
+	s.unboundBytes -= n
+	if s.unboundBytes < 0 {
+		s.unboundBytes = 0
+	}
+}
+
+// unboundDrain 清掉某 LSN 的整条台账并从现金扣除。多代共存时台账可能
+// 大于当前 redoMap 记录的长度(每代各自 reserve, 旧代等在账上) —— 按事件
+// 消费: 绑定/替代/压实丢弃任一终点事件发生即整条清账, 只释放 pos.length
+// 会留下旧代残账(又一处泄漏)。终点之后同 LSN 的再投递(直发重发、重绑定)
+// 全部 no-op。
+func (s *Store) unboundDrain(lsn uint64) {
+	p, ok := s.unboundPending[lsn]
+	if !ok {
+		return
+	}
+	delete(s.unboundPending, lsn)
+	s.unboundBytes -= p
+	if s.unboundBytes < 0 {
+		s.unboundBytes = 0
+	}
 }
 
 func (s *Store) Stats() Stats {
@@ -1402,6 +1487,11 @@ func (s *Store) Stats() Stats {
 		DirectIO:        s.directIO,
 		RedoHealedHoles: s.redoHealedHoles,
 		RedoHoleBytes:   s.redoHoleBytes,
+
+		RedoDirectSegs:   s.directRedoSegs,
+		RedoBoundSegs:    s.boundRedoSegs,
+		RedoBoundBytes:   s.boundRedoBytes,
+		RedoUnboundBytes: s.unboundBytes,
 	}
 }
 

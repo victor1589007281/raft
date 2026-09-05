@@ -62,6 +62,49 @@ func TestWriteRedoDirectDedup(t *testing.T) {
 	}
 }
 
+// J5: 直发接受/绑定计数 — Δbind/Δt = 绑定 segs/s, 多 raft 组立项判据的数据面。
+func TestWriteRedoDirectBindCounters(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "logs"), refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// 3 条直发: direct_segs=3, bind=0, unbound 水位上升
+	for i := uint64(1); i <= 3; i++ {
+		if err := s.WriteRedoDirect(0, i*1000, []byte("j5-payload")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := s.Stats()
+	if st.RedoDirectSegs != 3 || st.RedoBoundSegs != 0 {
+		t.Fatalf("after 3 direct: direct=%d bound=%d, want 3/0", st.RedoDirectSegs, st.RedoBoundSegs)
+	}
+	if st.RedoUnboundBytes <= 0 {
+		t.Fatalf("unbound water level must rise, got %d", st.RedoUnboundBytes)
+	}
+	// raft 绑定 1 条: bound_segs=1, unbound 恰好回落一条记录的量
+	before := s.Stats().RedoUnboundBytes
+	if err := s.StoreLog(&raft.Log{Index: 1000, Term: 1, Type: raft.LogCommand, Data: []byte("j5-payload")}); err != nil {
+		t.Fatal(err)
+	}
+	st = s.Stats()
+	if st.RedoDirectSegs != 3 || st.RedoBoundSegs != 1 {
+		t.Fatalf("after 1 bind: direct=%d bound=%d, want 3/1", st.RedoDirectSegs, st.RedoBoundSegs)
+	}
+	if dropped := before - st.RedoUnboundBytes; dropped != st.RedoBoundBytes {
+		t.Fatalf("unbound drop %d != bound bytes %d (口径不一致)", dropped, st.RedoBoundBytes)
+	}
+	// raft 路径写的段(无直发)也算绑定: IndexLSNCodec lsn=index=1001
+	// (索引必须连续; 1001 未被直发命中 → 走 wrote 路径建新段)
+	if err := s.StoreLog(&raft.Log{Index: 1001, Term: 1, Type: raft.LogCommand, Data: []byte("raft-path-payload")}); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.RedoBoundSegs != 2 {
+		t.Fatalf("raft-path seg must count as bound: %d", st.RedoBoundSegs)
+	}
+}
+
 func TestWriteRedoDirectBackpressure(t *testing.T) {
 	dir := t.TempDir()
 	opts := refOpts()
@@ -103,6 +146,116 @@ func TestWriteRedoDirectNonRef(t *testing.T) {
 	defer s.Close()
 	if err := s.WriteRedoDirect(0, 1, []byte("x")); err != ErrNotRefMode {
 		t.Fatalf("want ErrNotRefMode, got %v", err)
+	}
+}
+
+// J5 泄漏修复(9.24)回归: InnoDB 块渐满重发模式(同 LSN 多代, 逐代变长)。
+// 旧实现: 每代 reserve, 只有绑定侧 exact-match 按最新代长度扣一次 —— 旧代
+// 预留 60% 永久泄漏, 水位单调涨满 UnboundRedoLimit → 直发通道冻结(K6 实测
+// unbound 钉死 268435456 = 2^28)。修复后: 绑定=终点事件整条清账, 水位归零。
+func TestWriteRedoDirectMultiGenLeak(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "logs"), refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	const lsn = uint64(3000)
+	// 三代重发: 512B 块随填充重写, 逐代变长(更新快照路径)。
+	gens := [][]byte{
+		bytes.Repeat([]byte("a"), 100),
+		bytes.Repeat([]byte("b"), 300),
+		bytes.Repeat([]byte("c"), 500),
+	}
+	var peak int64
+	for i, g := range gens {
+		if err := s.WriteRedoDirect(0, lsn, g); err != nil {
+			t.Fatalf("gen %d: %v", i, err)
+		}
+		if after := s.Stats().RedoUnboundBytes; after > peak {
+			peak = after
+		}
+	}
+	// 只有最新一代真实占盘; 旧两代应已被重写路径清账。台账口径 = 记录全长
+	// (recLen = 4 + frame(24B) + payload), 从 redoMap 取实际值。
+	st := s.Stats()
+	lastGen := gens[2]
+	wantLen := int64(s.redoMap[lsn].length)
+	if st.RedoUnboundBytes != wantLen {
+		t.Fatalf("unbound after 3 gens = %d, want latest gen record %d (旧代残账泄漏)", st.RedoUnboundBytes, wantLen)
+	}
+	if peak > wantLen {
+		t.Fatalf("interim peak %d exceeded latest gen record %d", peak, wantLen)
+	}
+	// 绑定: 终点事件整条清账 → 水位归零; bound bytes = 最新代记录全长。
+	if err := s.StoreLog(&raft.Log{Index: 3000, Term: 1, Type: raft.LogCommand, Data: lastGen}); err != nil {
+		t.Fatal(err)
+	}
+	st = s.Stats()
+	if st.RedoUnboundBytes != 0 {
+		t.Fatalf("unbound after bind = %d, want 0", st.RedoUnboundBytes)
+	}
+	if got := st.RedoBoundBytes; got != wantLen {
+		t.Fatalf("bound bytes = %d, want %d (最新代记录全长)", got, wantLen)
+	}
+	// 防双扣: 已绑定 LSN 的重发(直发 absorb + raft 重投)不得使现金变负或动台账。
+	if err := s.WriteRedoDirect(0, lsn, lastGen); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.RedoUnboundBytes != 0 {
+		t.Fatalf("post-bind re-delivery moved unbound: %d", st.RedoUnboundBytes)
+	}
+	// 现金=Σ台账 不变式(内部字段直接核)
+	var sum int64
+	for _, p := range s.unboundPending {
+		sum += p
+	}
+	if sum != s.unboundBytes {
+		t.Fatalf("invariant broken: cash %d != Σledger %d", s.unboundBytes, sum)
+	}
+	// 负残留双扣(旧版无 !ok 闸门时, 重发会使现金被重复扣减)
+	if s.unboundBytes < 0 {
+		t.Fatalf("negative cash: %d", s.unboundBytes)
+	}
+}
+
+// TestWriteRedoDirectUnboundReloadRebuild: 重启后台账从 redo 扫描重建 ——
+// 未绑定直发残留(崩溃时未及绑定)重新挂账, 已绑定者不入账。
+func TestWriteRedoDirectUnboundReloadRebuild(t *testing.T) {
+	dir := t.TempDir()
+	lp := filepath.Join(dir, "logs")
+	s, err := Open(lp, refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteRedoDirect(0, 4001, []byte("unbound-on-crash")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreLog(&raft.Log{Index: 4002, Term: 1, Type: raft.LogCommand, Data: []byte("bound-payload")}); err != nil {
+		t.Fatal(err)
+	}
+	before := s.Stats().RedoUnboundBytes
+	if before <= 0 {
+		t.Fatalf("pre-restart unbound must be >0, got %d", before)
+	}
+	s.Close()
+	s2, err := Open(lp, refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	after := s2.Stats().RedoUnboundBytes
+	if after != before {
+		t.Fatalf("reloaded unbound = %d, want %d (台账从 redo 重建)", after, before)
+	}
+	// 重建的台账仍可被绑定清账(残余段最终归宿正确)
+	if err := s2.StoreLog(&raft.Log{Index: 4003, Term: 1, Type: raft.LogCommand, Data: []byte("unbound-on-crash")}); err != nil {
+		t.Fatal(err)
+	}
+	// 4003 的 lsn != 4001, 不会命中 —— 用 ReadRedo 确认未绑定字节仍在,
+	// 由业务侧绑定路径另行处理; 此处只断言重建值恒等。
+	if _, ok := s2.ReadRedo(4001); !ok {
+		t.Fatal("unbound direct bytes lost on reload")
 	}
 }
 

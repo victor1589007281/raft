@@ -69,10 +69,16 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 					s.mu.Unlock()
 					return nil // 完全相等: 幂等
 				case len(payload) <= len(existing) && (diff == len(payload) || diff < redoBlockHeaderLen):
+					// 旧快照迟到(更短/同长): 保留已存的更新版本。直发重发被
+					// 吸收 —— 本次的预留不发生(在下方记账点跳过), 既有台账不动。
 					s.mu.Unlock()
-					return nil // 旧快照迟到(更短/同长): 保留已存的更新版本
+					return nil
 				case len(payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
-					// 更新快照: 落到下面重写
+					// 更新快照: 落到下面重写。旧代预留先整条清账(被新记录
+					// 替代 —— 多代 v1→v2→v3 各自挂账, 若只靠绑定侧释放
+					// pos.length 会留下旧代残账, K6 实测的 60% 泄漏主体);
+					// 新代预留由下方记账点登记。
+					s.unboundDrain(lsn)
 				default:
 					if _, bound := s.lsnIndex[lsn]; bound {
 						s.mu.Unlock()
@@ -81,6 +87,8 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 					if s.opts.Logger != nil {
 						s.opts.Logger.Printf("[WARN] filestore: direct lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", lsn, len(existing), len(payload), diff)
 					}
+					// 未绑定异字节重写: 同样整条清账再重写(旧记录被替代)。
+					s.unboundDrain(lsn)
 				}
 			}
 		}
@@ -104,7 +112,8 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 			buf = append(buf, make([]byte, pad)...)
 		}
 		s.redoEnd = off + align512(int64(len(buf)))
-		s.unboundBytes += int64(recLen)
+		// J5 泄漏修复(9.24): 预留登记台账(per-LSN), 绑定/重写按账释放。
+		s.unboundReserve(lsn, int64(recLen))
 		f := s.redoF
 		// 持链移交(与 pinRefReadLocked 同构): 仍持 mu 时取 redoIoMu.RLock ——
 		// 压实换刀需 mu.Lock+redoIoMu.Lock, 此移交令换刀绝不可能在我的
@@ -114,10 +123,7 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 
 		rollbackReservation := func() {
 			s.mu.Lock()
-			s.unboundBytes -= int64(recLen)
-			if s.unboundBytes < 0 {
-				s.unboundBytes = 0
-			}
+			s.unboundRelease(lsn, int64(recLen))
 			s.mu.Unlock()
 		}
 
@@ -152,10 +158,7 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 		// ---- 阶段 3(锁内): 发布映射; fd 已被压实换掉则整体重来 ----
 		s.mu.Lock()
 		if s.redoF != f {
-			s.unboundBytes -= int64(recLen)
-			if s.unboundBytes < 0 {
-				s.unboundBytes = 0
-			}
+			s.unboundRelease(lsn, int64(recLen))
 			s.mu.Unlock()
 			continue // 压实把未发布记录留在旧 inode —— 必须以新 fd 重写
 		}
@@ -165,7 +168,13 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 		if s.redoMap == nil {
 			s.redoMap = make(map[uint64]redoPos)
 		}
+		// 发布即终点切换: 若同 LSN 在我阶段1清账后又有并发直发先发布(我的
+		// 预留+它的台账并存), 我这条是旧记录被替代 —— 整条清账后按我的
+		// recLen 重新挂账, 现金与 redoMap 始终同代。
+		s.unboundDrain(lsn)
 		s.redoMap[lsn] = redoPos{off: off, length: recLen}
+		s.unboundReserve(lsn, int64(recLen))
+		s.directRedoSegs++ // J5: 直发接受计数(未绑定, 等待 raft meta 建引用)
 		s.mu.Unlock()
 		return nil
 	}

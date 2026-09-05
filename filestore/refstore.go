@@ -270,21 +270,22 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 					if rerr == nil {
 						diff := firstDiffAt(existing, seg.Payload)
 						_, bound := s.lsnIndex[seg.LSN]
+						// J5 泄漏修复(9.24): 各分支不再逐个扣预留 —— 记账统一
+						// 收口到下方 commit 循环的 unboundDrain(绑定=终点事件,
+						// 整条清账, 同 LSN 多代台账一次清零)。旧实现只有
+						// exact-match 按最新代长度扣减, keep/rewrite/fencing
+						// 各分支全漏, 同 LSN 块渐满多代重写下 60% 预留永久
+						// 泄漏, 水位涨满 UnboundRedoLimit → 直发通道永久背压。
 						switch {
 						case diff == -1:
 							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
-							if s.unboundBytes > 0 {
-								s.unboundBytes -= int64(pos.length)
-								if s.unboundBytes < 0 {
-									s.unboundBytes = 0
-								}
-							}
 							continue
 						case len(seg.Payload) > len(existing) && (diff == len(existing) || diff < redoBlockHeaderLen):
 							if s.opts.Logger != nil {
 								s.opts.Logger.Printf("[INFO] filestore: lsn=%d 段快照更新 %d→%d 字节(firstDiff=%d, bound=%v)", seg.LSN, len(existing), len(seg.Payload), diff, bound)
 							}
-							// 落到重写路径
+							// 落到重写路径(新记录绑定时刻按其长度统一补齐
+							// 绑定量计数; 旧代台账由 commit 循环清账)。
 						case len(seg.Payload) <= len(existing) && (diff == len(seg.Payload) || diff < redoBlockHeaderLen):
 							// 更短/同长的旧快照迟到: 保留已存(更新)者
 							srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
@@ -303,7 +304,7 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 							// fallthrough to rewrite below
 						}
 					}
-					// rerr != nil (存在映射但读不出): 视为缺失, 重写
+					// rerr != nil (存在映射但读不出): 视为缺失, 重写。
 				}
 				body := framer.Frame(base, seg.LSN, seg.Payload)
 				var rec [4]byte
@@ -390,6 +391,15 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 				s.lsnIndex = make(map[uint64]lsnPos)
 			}
 			s.lsnIndex[sr.lsn] = lsnPos{index: metas[i].Index, off: sr.off}
+			// J5 泄漏修复(9.24): 绑定 = 直发记录的终点事件 —— 整条清账(同
+			// LSN 多代预留一次清零, 之后同 LSN 的重发/重绑定全部 no-op)。
+			// raft 原生段的台账天然为空, drain 同样 no-op, 计数继续按
+			// 记录全长累计(bound 口径与之前一致)。
+			s.unboundDrain(sr.lsn)
+			// J5: 绑定时刻 = meta 首次建 lsnIndex 引用。字节数按记录全长计
+			// (与 unboundBytes 预留口径一致)。
+			s.boundRedoSegs++
+			s.boundRedoBytes += int64(sr.length)
 		}
 	}
 	s.endOff = baseOff + align512(int64(len(metaBytes)))
@@ -582,6 +592,19 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	s.endOff = metaGood
 	s.redoEnd = redoGood
 	s.truncateAtGapLocked()
+	// J5 泄漏修复(9.24): 台账随进程存亡 —— 重启后从 redo 扫描重建: redoMap
+	// 里未被任何 meta 引用(lsnIndex 无)的 lsn 即未绑定直发残留, 重新挂账,
+	// 现金恢复等价水位; 台账不跨进程持久化(现金额随 map 重建, 无泄漏窗口)。
+	if len(s.redoMap) > 0 {
+		s.unboundPending = make(map[uint64]int64)
+		s.unboundBytes = 0
+		for lsn, pos := range s.redoMap {
+			if _, bound := s.lsnIndex[lsn]; !bound {
+				s.unboundPending[lsn] = int64(pos.length)
+				s.unboundBytes += int64(pos.length)
+			}
+		}
+	}
 	return nil
 }
 
@@ -760,6 +783,18 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 	s.redoF = newF
 	s.redoMap = newMap
 	s.redoEnd = writeOff
+	// J5 泄漏修复(9.24): 被压实丢弃的 lsn(< keepFrom, 盘上字节已消失)整条
+	// 清账 —— 否则未绑定直发记录被 GC 后残账钉住水位。幸存者保留台账继续
+	// 等绑定(其字节已搬入新文件)。
+	for lsn, p := range s.unboundPending {
+		if lsn < keepFromLSN {
+			delete(s.unboundPending, lsn)
+			s.unboundBytes -= p
+		}
+	}
+	if s.unboundBytes < 0 {
+		s.unboundBytes = 0
+	}
 	_ = oldF.Close()
 	s.redoIoMu.Unlock()
 	return nil
