@@ -1495,6 +1495,111 @@ func (s *Store) Stats() Stats {
 	}
 }
 
+// DiagUnboundLsns 是只读诊断(J5 泄漏定位): 返回台账里的 lsn 有序样本。
+func (s *Store) DiagUnboundLsns() []uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]uint64, 0, len(s.unboundPending))
+	for lsn := range s.unboundPending {
+		out = append(out, lsn)
+	}
+	return out
+}
+
+// DiagLsnIndexStats 返回 lsnIndex(绑定域)的 (n, min, max) —— 诊断: 对比
+// raft 绑定域与直发台账域是否同域。
+func (s *Store) DiagLsnIndexStats() (n int, min, max uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	min, max = ^uint64(0), 0
+	for lsn := range s.lsnIndex {
+		n++
+		if lsn < min {
+			min = lsn
+		}
+		if lsn > max {
+			max = lsn
+		}
+	}
+	return n, min, max
+}
+
+// DiagLsnIndex 查询某 lsn 是否已绑定(在 lsnIndex 里)及其引用的 raft index。
+func (s *Store) DiagLsnIndex(lsn uint64) (bound bool, index uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.lsnIndex[lsn]; ok {
+		return true, p.index
+	}
+	return false, 0
+}
+
+// DiagRedoLsnSample 返回 redoMap 里的 lsn 有序样本(诊断: 对比直发域与绑定域)。
+func (s *Store) DiagRedoLsnSample(limit int) []uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]uint64, 0, limit)
+	for lsn := range s.redoMap {
+		out = append(out, lsn)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// DiagUnboundAudit 是 J5 泄漏的精确对账(只读诊断)。盘上未绑定记录分三类,
+// 现金只对第一类负责:
+//   ledgered = 台账在册且盘上有字节 —— 正常绑定滞后, cash 应 = Σ其记录全长。
+//     盘上字节比台账短的部分(同 LSN 更短新代已占盘)计入 over(多记账, 现金
+//     按旧代全长持有而盘上已无该字节)。
+//   missing  = 盘上有字节、未绑定(lsnIndex 无)、台账无账 —— 残留类。来源:
+//     DeleteRange(快照截断/日志压实)清 lsnIndex 绑定而不清 redo 字节; 兜底
+//     分支(重载时误判已绑定)。现金无需对它负责 —— 该类字节会在下一次
+//     CompactRedo 时被 GC(keepFrom 之下)并同步清账, 或重启 reloadRef 重新
+//     reserve 归入正常类。>0 恒表示"有等待回收的化石", 不漂移现金。
+//   orphan   = 台账在册而 redoMap 已无字节(账悬空) —— 严格异常, 计数。
+// 离线重扫口径(全盘未绑定) = ledgeredDisk + missing; 现金对账恒等式:
+//   cash == Σ(ledgered 记录全长) - over  (多代残账经终点事件清账后应恒成立)。
+func (s *Store) DiagUnboundAudit() (cash, ledgeredDisk, over, missing int64, orphanLsns []uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cash = s.unboundBytes
+	for lsn, p := range s.unboundPending {
+		pos, ok := s.redoMap[lsn]
+		if !ok {
+			orphanLsns = append(orphanLsns, lsn)
+			continue
+		}
+		ledgeredDisk += int64(pos.length)
+		if int64(pos.length) > p {
+			over += int64(pos.length) - p
+		}
+	}
+	for lsn, pos := range s.redoMap {
+		if _, bound := s.lsnIndex[lsn]; bound {
+			continue
+		}
+		if _, inLedger := s.unboundPending[lsn]; !inLedger {
+			missing += int64(pos.length)
+		}
+	}
+	return cash, ledgeredDisk, over, missing, orphanLsns
+}
+
+// DiagSplitEntry 按 store 自带 codec 解析一条 raft 条目的 Data, 返回它引用的
+// (base, 段 LSNs) —— 诊断: 对比 raft 绑定域与直发台账域是否同域。
+func (s *Store) DiagSplitEntry(data []byte) (uint64, []uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	base, segs := s.splitEntry(&raft.Log{Data: data})
+	lsns := make([]uint64, len(segs))
+	for i, seg := range segs {
+		lsns[i] = seg.LSN
+	}
+	return base, lsns
+}
+
 // ---------------------------------------------------------------------------
 // Ref-mode business read API (12.14.3): the redo view of the store.
 

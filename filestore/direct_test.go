@@ -527,3 +527,110 @@ type mockSnap struct{}
 
 func (s *mockSnap) Persist(raft.SnapshotSink) error { return nil }
 func (s *mockSnap) Release()                        {}
+
+// TestDiagUnboundAuditLifecycle: J5 对账恒等式全生命周期锁定 —— 直发→绑定→
+// 重写→再绑定→DeleteRange 解绑→压实 六个事件后的 cash/over/missing 语义。
+// 锁定的不变式:
+//   ① cash == ledgeredDisk − over 恒成立(任何事件后)。
+//   ② 绑定/重写终点后 missing == 0(终点事件即清账, 无残留)。
+//   ③ DeleteRange 解绑后 missing = 被解绑记录全长(化石类, 现金不动)。
+//   ④ 压实 GC 掉化石字节并同步清账 → missing 归零, 现金不变。
+func TestDiagUnboundAuditLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "logs"), refOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// ① 直发 3 条(1000, 2000, 3000), 各不同长度便于区分分量。
+	if err := s.WriteRedoDirect(0, 1000, []byte("alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteRedoDirect(0, 2000, bytes.Repeat([]byte("b"), 400)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteRedoDirect(0, 3000, bytes.Repeat([]byte("c"), 700)); err != nil {
+		t.Fatal(err)
+	}
+	cash, ledgered, over, missing, orphans := s.DiagUnboundAudit()
+	if len(orphans) != 0 || missing != 0 || over != 0 {
+		t.Fatalf("fresh direct: orphans=%d missing=%d over=%d, want 0/0/0", len(orphans), missing, over)
+	}
+	if cash != ledgered {
+		t.Fatalf("fresh direct: cash %d != ledgeredDisk %d", cash, ledgered)
+	}
+	// ①b 绑定 1000(空 meta 首条可任意落点; IndexLSNCodec lsn=index): dedup
+	// keep 分支保住 redo 副本, lsnIndex 挂绑定, 台账整条清账 —— 现金少 29。
+	if err := s.StoreLog(&raft.Log{Index: 1000, Term: 1, Type: raft.LogCommand, Data: []byte("alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	// ①c 桥接 [1001..2000): raft 绑定要求索引连续(lsn=index), 逐条补齐洞。
+	for i := uint64(1001); i < 2000; i++ {
+		if err := s.StoreLog(&raft.Log{Index: i, Term: 1, Type: raft.LogCommand, Data: []byte("bridge")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ② 2000 的同 LSN 更长新代重写(direct.go 更新快照分支 drain+reserve: 更短
+	// 会命中"旧快照迟到→保留已存"被吸收, 不构成重写): 现金只持有新代, over
+	// 不得残留。
+	z := bytes.Repeat([]byte("z"), 500)
+	if err := s.WriteRedoDirect(0, 2000, z); err != nil {
+		t.Fatal(err)
+	}
+	cash, ledgered, over, missing, _ = s.DiagUnboundAudit()
+	if over != 0 {
+		t.Fatalf("after rewrite: over=%d, want 0 (旧代清账)", over)
+	}
+	if cash != ledgered {
+		t.Fatalf("after rewrite: cash %d != ledgered %d", cash, ledgered)
+	}
+	if got := int64(s.redoMap[2000].length); got != int64(4+16+500+4) {
+		t.Fatalf("after rewrite: redoMap[2000].length=%d, want 524 (新代已发布)", got)
+	}
+	// ③ 绑定 2000(1000 已在 ①b 绑定): 整条清账 → 现金只剩 3000 的台账。
+	if err := s.StoreLog(&raft.Log{Index: 2000, Term: 1, Type: raft.LogCommand, Data: z}); err != nil {
+		t.Fatal(err)
+	}
+	cash, ledgered, _, missing, _ = s.DiagUnboundAudit()
+	want3000 := int64(s.redoMap[3000].length) // 记录全长(含 frame)口径
+	if cash != want3000 || ledgered != want3000 || missing != 0 {
+		t.Fatalf("after bind: cash=%d ledgered=%d missing=%d, want all=%d", cash, ledgered, missing, want3000)
+	}
+	// ④ DeleteRange [1000..2000](min==first → 整段删除, lsnIndex 清空): 全部
+	// ≤2000 的 redo 字节(直发 1000/2000 + raft 桥接段)绑定消失且台账已清 →
+	// 化石类(missing), 现金不动 —— 生产 62.9MB 漏账即此形态(DeleteRange 解绑
+	// 残留, 等压实回收/重启重挂, 不漂现金)。
+	cash2Before, _, _, _, _ := s.DiagUnboundAudit()
+	if err := s.DeleteRange(1000, 2000); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, missing2, _ := s.DiagUnboundAudit()
+	var wantFossil int64
+	for lsn, pos := range s.redoMap {
+		if lsn <= 2000 {
+			wantFossil += int64(pos.length)
+		}
+	}
+	if missing2 != wantFossil {
+		t.Fatalf("after DeleteRange: missing=%d, want %d (被解绑记录全长)", missing2, wantFossil)
+	}
+	cash2, _, _, _, _ := s.DiagUnboundAudit()
+	if cash2 != cash2Before {
+		t.Fatalf("DeleteRange moved cash: %d → %d (化石不漂现金)", cash2Before, cash2)
+	}
+	// ⑤ 压实 keepFrom=2500: <2500 的化石字节被 GC, 幸存者 3000 保留台账 →
+	// missing 归零, 现金不变。(refSegs 已被 ④ 清空, keepFrom 不被夹回 1000。)
+	if err := s.CompactRedo(2500); err != nil {
+		t.Fatal(err)
+	}
+	cash3, _, _, missing3, _ := s.DiagUnboundAudit()
+	if missing3 != 0 {
+		t.Fatalf("after compact: missing=%d, want 0 (化石被 GC 同步清账)", missing3)
+	}
+	if cash3 != cash2 {
+		t.Fatalf("compact moved cash: %d → %d (幸存者保留台账)", cash2, cash3)
+	}
+	if p, ok := s.ReadRedo(3000); !ok || len(p) != 700 {
+		t.Fatalf("survivor 3000 must survive compact: len=%d ok=%v", len(p), ok)
+	}
+}
