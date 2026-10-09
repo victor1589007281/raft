@@ -92,12 +92,23 @@ func TestRefDedupBlockExtension(t *testing.T) {
 	if err := s.StoreLog(mkBatchEntry(4, RedoSegment{LSN: 3000, Payload: append([]byte("0123456789ab"), bytes.Repeat([]byte("Z"), 16)...)})); err != nil {
 		t.Fatal(err)
 	}
+	// epoch-fencing 默认语义(2026-10-09 定案): 已绑定分叉 = 死代缓冲尾 ⇒
+	// 让位重写(成功), 服务内容换为新代字节, 审计行留证
 	q := append([]byte("0123456789ab"), bytes.Repeat([]byte("Q"), 16)...)
-	if err := s.WriteRedoDirect(0, 3000, q); err == nil {
-		t.Fatal("已绑定头区外分叉应报 fencing 错误")
+	if err := s.WriteRedoDirect(0, 3000, q); err != nil {
+		t.Fatalf("epoch-fencing 默认应让位重写: %v", err)
 	}
-	if p, ok := s.ReadRedo(3000); !ok || p[16] != 'Z' {
-		t.Fatalf("已绑定分叉必须保留已提交字节: %v,%v", p[16:], ok)
+	if p, ok := s.ReadRedo(3000); !ok || p[16] != 'Q' {
+		t.Fatalf("死代让位后应服务新内容: %v,%v", p[16:], ok)
+	}
+	// 保险丝: KEEP_OLD 恢复冻结语义
+	fencingKeepOld.Store(true)
+	defer fencingKeepOld.Store(false)
+	if err := s.WriteRedoDirect(0, 3000, append([]byte("0123456789ab"), bytes.Repeat([]byte("R"), 16)...)); err == nil {
+		t.Fatal("KEEP_OLD 下已绑定分叉应报 fencing 错误")
+	}
+	if p, ok := s.ReadRedo(3000); !ok || p[16] != 'Q' {
+		t.Fatalf("KEEP_OLD 下必须保留已提交字节: %v,%v", p[16:], ok)
 	}
 	// direct 路径的块渐满扩展: 先短后长, direct 自己也扩展
 	if err := s.WriteRedoDirect(0, 4000, []byte("1234")); err != nil {

@@ -1,5 +1,22 @@
 package filestore
 
+// DeleteRange / 重载路径的护栏。
+//
+// 本文件与 deleterange_invariant_test.go 是一对: 那边把 DeleteRange 的**后置条件**
+// (稠密不变量 + 幸存者集合 + 重载后一致)从外部读回来; 这边钉住**保证该不变量成立**的
+// 那几道闸门。两边缺一不可 ——
+//
+//	deleteRangeRewriteLocked 里的 `drop := max - s.first + 1` 是**位置算术**, 它只有在
+//	「内存视图稠密 且 s.first == s.logs[0].Index」时才等于「删除的条数」。这个前提不是
+//	DeleteRange 自己维护的, 而是由下面三道闸门共同保证的:
+//	  ① StoreLogs 的连续性护栏 —— 洞**写不进去**(TestStoreLogsContiguityGuard);
+//	  ② 重载时的洞截断           —— 盘上历史遗留的洞在进 NewRaft 前就被截掉(TestReloadGapTruncation);
+//	  ③ 整段删除把 first 归零    —— 下一代的 first 不带上一代的索引(deleterange_invariant_test.go)。
+//	任何一道失效, drop 就会偏小并把**存活**条目一起切掉, 而且是静默的(返回 nil)。
+//
+// 这三道闸门曾经只是**设计意图**; #105-B 修好之后快照回退变成可达路径, DeleteRange
+// 的调用频率显著上升, 于是它们的正确性从"反正不会走到"变成了"每装一次快照都走一遍"。
+
 import (
 	"encoding/binary"
 	"os"
@@ -9,67 +26,6 @@ import (
 
 	"github.com/hashicorp/raft"
 )
-
-// TestDeleteRangePrefixKeepsSuffix: raft 快照压实是前缀删除 [first, K] ——
-// (K, last] 必须存活(历史上这里误用截断,把整个日志抹掉)。v2-singlewal。
-func TestDeleteRangePrefixKeepsSuffix(t *testing.T) {
-	dir := t.TempDir()
-	lp := filepath.Join(dir, "logs")
-	s, err := Open(lp, v2opts())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.StoreLogs(mkLogs(1, 10, "pfx")); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.DeleteRange(1, 6); err != nil {
-		t.Fatal(err)
-	}
-	if first, _ := s.FirstIndex(); first != 7 {
-		t.Fatalf("first = %d, want 7", first)
-	}
-	if last, _ := s.LastIndex(); last != 10 {
-		t.Fatalf("last = %d, want 10", last)
-	}
-	for i := uint64(7); i <= 10; i++ {
-		var l raft.Log
-		if err := s.GetLog(i, &l); err != nil {
-			t.Fatalf("GetLog(%d) after prefix compaction: %v", i, err)
-		}
-		if l.Index != i {
-			t.Fatalf("GetLog(%d) returned entry %d", i, l.Index)
-		}
-	}
-	if err := s.GetLog(6, &raft.Log{}); err == nil {
-		t.Fatal("compacted GetLog(6) should fail")
-	}
-	if _, ok := s.LookupByLSN(5); ok {
-		t.Fatal("sparse index not pruned for compacted prefix")
-	}
-	if _, ok := s.LookupByLSN(8); !ok {
-		t.Fatal("survivor lsn pruned")
-	}
-	// 重启后存活 + 可继续连续追加
-	s.Close()
-	s2, err := Open(lp, v2opts())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	if first, _ := s2.FirstIndex(); first != 7 {
-		t.Fatalf("post-restart first = %d, want 7", first)
-	}
-	var l raft.Log
-	if err := s2.GetLog(10, &l); err != nil || l.Index != 10 {
-		t.Fatalf("post-restart GetLog(10): %v idx=%d", err, l.Index)
-	}
-	if err := s2.StoreLogs(mkLogs(11, 2, "pfx2")); err != nil {
-		t.Fatalf("append after prefix compaction: %v", err)
-	}
-	if err := s2.GetLog(12, &l); err != nil {
-		t.Fatalf("GetLog(12): %v", err)
-	}
-}
 
 // TestRefDeleteRangePrefix: ref 模式前缀压实 —— 幸存者 meta 重写, redo 引用
 // 依然可解析(GetLog 重建 Data), redo.log 不被截断。

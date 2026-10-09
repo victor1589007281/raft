@@ -44,6 +44,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -292,11 +293,24 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 							continue
 						default:
 							if bound {
-								if s.opts.Logger != nil {
-									s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), diff, base)
+								// ★一次性 fencing 特赦: 仅当 env 武装的 LSN 命中此点,
+								// 死代(上代缓冲尾)让位于恢复后真历史 —— 审计双内容 FNV
+								// 与分叉点, 走下方重写路径(绑定时刻按新长度统一入账,
+								// 旧代台账由 commit 循环清账, 与常规重写完全同路)。
+								yield := fencingOverrideAll ||
+									(fencingOverrideLSN != 0 && fencingOverrideLSN == seg.LSN) ||
+									!fencingKeepOld.Load()
+								if yield {
+									if s.opts.Logger != nil {
+										s.opts.Logger.Printf("[WARN] filestore: ★死代让位 lsn=%d: 旧 %d 字节(fnv=%016x) → 新 %d 字节(fnv=%016x), firstDiff=%d(epoch-fencing 默认语义; 旧记录留在追加区可取证)", seg.LSN, len(existing), fnv1a64(existing), len(seg.Payload), fnv1a64(seg.Payload), diff)
+									}
+								} else {
+									if s.opts.Logger != nil {
+										s.opts.Logger.Printf("[ERROR] filestore: lsn=%d 已绑定但内容异变 —— fencing 违例, 保留已提交字节 (existLen=%d newLen=%d firstDiff=%d newBase=%d)", seg.LSN, len(existing), len(seg.Payload), diff, base)
+									}
+									srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
+									continue
 								}
-								srefs[j] = segRef{lsn: seg.LSN, off: pos.off, length: pos.length}
-								continue
 							}
 							if s.opts.Logger != nil {
 								s.opts.Logger.Printf("[WARN] filestore: lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", seg.LSN, len(existing), len(seg.Payload), diff)
@@ -658,6 +672,31 @@ const redoBlockHeaderLen = 12
 
 // firstDiffAt 返回两个字节串首个不同字节的偏移; 前缀相等但长度不同返回较短长度;
 // 完全相等返回 -1。供 fencing/快照更新诊断日志与判定使用。
+// fencingOverrideLSN: 一次性 fencing 特赦的目标 LSN(0=未武装)。
+// 由 Open 经 env LOGDB_FILESTORE_FENCING_OVERRIDE_LSN 武装; 语义见 filestore.go。
+var fencingOverrideLSN uint64
+
+// fencingOverrideAll: 临时手术模式(env LOGDB_FILESTORE_FENCING_OVERRIDE_ALL)——
+// 任意 LSN 的绑定异变都让位于当前代(全量 FNV 审计)。仅排雷期武装。
+var fencingOverrideAll bool
+
+// fencingKeepOld: 旧行为保险丝(env LOGDB_FILESTORE_FENCING_KEEP_OLD=1)——
+// 绑定异变时冻结保留旧字节(2026-10-09 前的默认)。默认关 = epoch 感知让位:
+// 能过 RPC 层 writer_epoch 闸的写皆是当前代, 绑定层撞见的分叉必为死代缓冲尾
+// (同代重写经 fnv 实证恒字节一致), 死代让位 + FNV 审计, 旧记录仍在追加区
+// 可取证。特赦 env(OVERRIDE_LSN/_ALL)仍兼容(强制让位), 优先级高于保险丝。
+var fencingKeepOld atomic.Bool
+
+// fnv1a64: 审计用内容指纹(FNV-1a 64)。
+func fnv1a64(b []byte) uint64 {
+	h := uint64(14695981039346656037)
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	return h
+}
+
 func firstDiffAt(a, b []byte) int {
 	n := len(a)
 	if len(b) < n {
@@ -677,6 +716,10 @@ func firstDiffAt(a, b []byte) int {
 // ---------------------------------------------------------------------------
 // Compaction (checkpoint-driven prefix GC; NOT DeleteRange — see file header).
 
+// compactSkipCount 统计「keepFrom 被 clamp 到最小存活 LSN ⇒ 无可丢 ⇒ 跳过重写」的次数。
+// 仅用于日志节流(见 CompactRedo), 不参与任何判定。
+var compactSkipCount uint64
+
 // CompactRedo drops redo records with lsn < keepFromLSN by rewriting the
 // survivors to a fresh file and renaming it over redo.log. keepFrom is
 // clamped to the smallest lsn still referenced by live meta entries, so
@@ -684,8 +727,31 @@ func firstDiffAt(a, b []byte) int {
 // from the business checkpoint (raft log snapshot must cover the dropped
 // range first).
 func (s *Store) CompactRedo(keepFromLSN uint64) error {
+	// ★#105 诊断(2026-09-25): 先**只测量**, 不改语义。
+	// 待证假设: 压实持 s.mu.Lock() 横跨「读旧→校验→写新→Sync→Rename→syncDir」全过程
+	// (见下方换刀临界区注释), 而重写体积 ∝ len(redoMap)、redoMap 又随检查点滞后增长
+	// ⇒ StoreLogs 被串住 ⇒ 建表塌速。这条假设此前**未被证明**, 所以先打点再动手。
+	// 两个数分开打: wait=等锁(别人占着, 直接反映对写路径的阻塞),
+	// run=本次重写(含 Sync), 两者一起才能区分「锁被谁占」和「占多久」。
+	tEnter := time.Now()
 	s.mu.Lock()
+	waited := time.Since(tEnter)
 	defer s.mu.Unlock()
+	// ★len(s.redoMap) 必须在**取到锁之后**读: 它在 StoreLogs/WriteRedoDirect 里被写,
+	// 锁外读是数据竞争(-race 实测: refstore.go:699 对 refstore.go:387/direct.go:175
+	// 的 mapassign)。取到锁后读到的才是「本次重写要遍历的那个 map」的大小 ——
+	// 也正是打点想量的那个数(等锁那段时间里 map 长没长, 与本次重写体积无关)。
+	redoMapLenAtEntry := len(s.redoMap)
+	// 注意 defer 是后进先出: 本函数在 s.mu.Unlock() **之前**执行, 仍在锁内。
+	// 只读局部变量 + 一次 stderr 写, 且仅在超阈值时发生, 不改变热路径。
+	defer func() {
+		if d := time.Since(tEnter); d >= 100*time.Millisecond {
+			fmt.Fprintf(os.Stderr,
+				"[#105][compact] CompactRedo 慢: 总耗时=%v 等锁=%v redoMap=%d 条 keepFrom=%d\n",
+				d.Round(time.Millisecond), waited.Round(time.Millisecond),
+				redoMapLenAtEntry, keepFromLSN)
+		}
+	}()
 	if s.format != "v2-ref" || s.redoF == nil {
 		return nil
 	}
@@ -695,6 +761,36 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 				keepFromLSN = lsn
 			}
 		}
+	}
+	// ★#105 修复(2026-09-25): 「无可丢 ⇒ 直接返回, 不重写」。
+	//
+	// 上面那个 clamp 把 keepFromLSN 压到**现存最老 raft 条目所引用的 LSN**。当 raft
+	// 日志因快照滞后而不被截断时(本档实测: FSM 快照停在 index=10298, commit=18765),
+	// 这个 LSN 恒等于 redoMap 的最小 LSN ⇒ 下面的重写会**逐字节复制整个文件、一条都不丢**。
+	// 实测(logdb-tps 41k 表档, 2026-09-25 20:15):
+	//   redo.log 恒 872415232B = 832MiB, 每 ~20s 被完整重写一次;
+	//   tmp 文件实测长到 752MB / 870MB 才 rename(即整文件重写而非部分);
+	//   占 1.8T 数据盘的 40%, 全程持 s.mu.Lock()(含 nf.Sync()) ⇒ StoreLogs 被串住;
+	//   调用侧读数 storeq/storew=12987ms、commit_t=18091ms, 建表塌到 0.5 表/s。
+	// 重写的**语义目标**是「丢掉 < keepFrom 的记录」; 没有可丢的 ⇒ 目标已达成 ⇒ 不该写。
+	//
+	// 刻意**不**顺带回收「未被 redoMap 引用的字节」(空洞/陈旧段): 那正是需要持锁做
+	// 全文件重写的那部分, 而在 keepFrom 被 clamp 到最小 LSN 的前提下, 它们对应的空间
+	// 收益远小于「整文件重写 + fsync」的代价。要回收它们应该走增量/后台路径, 而不是
+	// 让写路径在每一次检查点上都付一遍 832MiB 的账。
+	minLSN, have := uint64(0), false
+	for lsn := range s.redoMap {
+		if !have || lsn < minLSN {
+			minLSN, have = lsn, true
+		}
+	}
+	if !have || keepFromLSN <= minLSN {
+		if n := atomic.AddUint64(&compactSkipCount, 1); n == 1 || n%1000 == 0 {
+			fmt.Fprintf(os.Stderr,
+				"[#105][compact] 跳过重写(无可丢): keepFrom=%d redoMap=%d 条 minLSN=%d 第%d次\n",
+				keepFromLSN, len(s.redoMap), minLSN, n)
+		}
+		return nil
 	}
 	framer := s.opts.Framer
 	if framer == nil {

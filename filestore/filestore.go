@@ -32,6 +32,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/hashicorp/go-msgpack/v2/codec"
@@ -149,18 +150,20 @@ func (o Options) resolvedMode() Mode {
 // On-disk formats (little-endian).
 //
 // v2 file header (512 B, written once at creation):
-//   [0:4]   magic "VWAL"
-//   [4:6]   u16 formatMajor = 2
-//   [6:8]   u16 fileFlags (bit0 singleWAL; bit1 batch-pad512)
-//   [8:512] reserved zero
+//
+//	[0:4]   magic "VWAL"
+//	[4:6]   u16 formatMajor = 2
+//	[6:8]   u16 fileFlags (bit0 singleWAL; bit1 batch-pad512)
+//	[8:512] reserved zero
 //
 // v2 record (records start at offset 512):
-//   [u32 totalLen]                     // = 24 + raftLen + dataLen + 4(crc)
-//   [u16 ver=2][u16 flags]
-//   [u64 base][u64 lsn]
-//   [u32 raftLen][msgpack(Log without Data)]
-//   [payload]
-//   [u32 crc32c over bytes [4 .. 4+totalLen-4)]
+//
+//	[u32 totalLen]                     // = 24 + raftLen + dataLen + 4(crc)
+//	[u16 ver=2][u16 flags]
+//	[u64 base][u64 lsn]
+//	[u32 raftLen][msgpack(Log without Data)]
+//	[payload]
+//	[u32 crc32c over bytes [4 .. 4+totalLen-4)]
 //
 // Batch: records concatenated, then zero padding to the next 512 B boundary.
 // Padding is never part of any record; reload treats a zero u32 at a record
@@ -168,7 +171,8 @@ func (o Options) resolvedMode() Mode {
 // zero as end-of-data (fallocate'd regions read as zeros).
 //
 // v1 (prototype compat, read-only): [u32 totalLen][u16 ver=1][u16 flags]
-//   [u64 base][u64 lsn][u32 raftLen][msgpack(Log without Data)][data] — no CRC.
+//
+//	[u64 base][u64 lsn][u32 raftLen][msgpack(Log without Data)][data] — no CRC.
 //
 // legacy: [u32 payloadLen][msgpack(Log)] repeated.
 const (
@@ -224,12 +228,13 @@ type scanStats struct {
 //     解码失败(errScanStop) = 撕尾, 停在洞后第一个垃圾块头 —— 与旧
 //     torn-tail 语义一致;
 //   - 零块一路到 EOF = 批尾填充, 数据终点(批对齐不变量保留)。
+//
 // 返回好数据终点(下一追加位置)。
 func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64, body []byte) error) (int64, scanStats, error) {
 	buf := bytes.NewReader(raw[start:])
 	off := start
 	var stats scanStats
-	zeroStart := int64(-1) // 最近一次跳过零区的起始偏移(-1 = 无)
+	zeroStart := int64(-1)  // 最近一次跳过零区的起始偏移(-1 = 无)
 	pendingZero := int64(0) // 最近一次跳过的零块字节数(可能是填充也可能是孔洞)
 	for {
 		var lenBuf [4]byte
@@ -318,9 +323,9 @@ type Store struct {
 	f        *os.File // raft.log (ref mode: meta records)
 	opts     Options
 	first    uint64 // index of logs[0] (0 when empty)
-	logs    []*raft.Log
-	offsets []int64 // file offset of logs[i] (points at the record's len field)
-	endOff  int64   // authoritative append position (512-aligned when v2)
+	logs     []*raft.Log
+	offsets  []int64 // file offset of logs[i] (points at the record's len field)
+	endOff   int64   // authoritative append position (512-aligned when v2)
 
 	format   string // "v2-ref" | "v2-singlewal" | "v1-singlewal" | "legacy" — detected
 	directIO bool   // effective after probe (v2 formats only)
@@ -375,6 +380,37 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{path: path, f: f, opts: opts}
+
+	// ★一次性 fencing 特赦(2026-10-09, 4920271805 洞实案): 上代从 log buffer 抢跑
+	// ship(比本地盘快), 崩溃把「仅 buffer」的尾字节绑定进存储; 本代从盘恢复
+	// (不含该尾) ⇒ 同 LSN 两种内容, 幂等吸收器按 fencing 保留死代 ⇒ frontier
+	// 永冻。env LOGDB_FILESTORE_FENCING_OVERRIDE_LSN=<lsn> 指定洞点: 该 LSN 的
+	// 绑定异变段改走重写(死代让位真历史), 审计双内容 FNV 留证。仅指定 LSN 生效,
+	// 用后须摘除 env(config hygiene)。
+	if v := os.Getenv("LOGDB_FILESTORE_FENCING_OVERRIDE_LSN"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n != 0 {
+			fencingOverrideLSN = n
+			if opts.Logger != nil {
+				opts.Logger.Printf("[WARN] filestore: fencing 特赦已武装: LSN=%d —— 该点的绑定异变将以新内容覆盖死代并审计双内容 FNV", n)
+			}
+		}
+	}
+	// 任意 LSN 特赦(临时手术模式): 崩溃代缓冲抢跑的死尾会在【每个】崩溃边界产叉,
+	// 逐 LSN 特赦赶不上产速。单写者秩序已由 RPC 层 writer_epoch fencing 保证,
+	// 此模式下任何 LSN 的绑定异变都判定为死代并让位于当前代, 全量 FNV 审计。
+	// ★仅排雷期临时武装, 净空后必须摘除。
+	if os.Getenv("LOGDB_FILESTORE_FENCING_KEEP_OLD") != "" {
+		fencingKeepOld.Store(true)
+		if opts.Logger != nil {
+			opts.Logger.Printf("[WARN] filestore: fencing 旧行为(冻结保留旧字节)已武装 —— 排雷期外请勿使用")
+		}
+	}
+	if os.Getenv("LOGDB_FILESTORE_FENCING_OVERRIDE_ALL") != "" {
+		fencingOverrideAll = true
+		if opts.Logger != nil {
+			opts.Logger.Printf("[WARN] filestore: ★fencing 特赦【全 LSN】模式已武装(临时排雷手术) —— 任何绑定异变都将以当前代内容覆盖死代并审计 FNV, 净空后摘除 env!")
+		}
+	}
 
 	metaInfo, err := f.Stat()
 	if err != nil {
@@ -860,8 +896,56 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 	// panic 才暴露 —— 任何不连续都必须在落盘前炸响, 而不是埋成洞。
 	if len(s.logs) > 0 {
 		if want, got := s.lastIndexLocked()+1, logs[0].Index; got != want {
-			return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole",
-				want-1, got, len(logs))
+			// ★幂等重写宽容(2026-10-02 实证: 行军 40k 档 leader 在正常任期中收到
+			//   first==last 的重写批 —— 疑似异步写者路径的重派; 原先一炸 ⇒
+			//   asyncWriteFailed 永久置坏 ⇒ leader step down ⇒ 长征楔死):
+			//   与既有条目【逐字节一致】(Index/Term/Data)的重叠是幂等重写 ——
+			//   raft 日志匹配原则下语义 = no-op ⇒ 剥掉重叠只追加新尾。
+			//   任一条目不一致 ⇒ 真冲突(洞/改写) ⇒ 维持 fail-closed。
+			if got < want { // 重写/重叠窗口: first <= last
+				overlap := want - got // 重叠条数 = last+1-first
+				// 比对口径: Index+Term 恒比; Data 仅在两侧都可比(非 ref 指针形态)时比。
+				// raft 语义下 (index,term) 唯一决定内容(同 term 同 index 不同数据 =
+				// 拜占庭, 正确 raft 永不产生), 故 Index+Term 全等对重写判定已充分;
+				// Data 比对是便宜处的锦上添花。护栏的本职(索引洞/越界跳)不受影响:
+				// got > want 仍硬拒, Index/Term 不一致仍硬拒。
+				// 实现注: 这里【不能】调 GetLog —— 它持 RLock(本函数已持写锁,
+				// Go 互斥锁不可重入)且 ref 路径会做锁移交(交出 s.mu)。
+				// peekLogMetaLocked 是纯内存的元数据读取, 无移交。
+				allSame := true
+				var missIn, missPrev uint64
+				for i := uint64(0); i < overlap && int(i) < len(logs); i++ {
+					prev, err := s.peekLogMetaLocked(logs[i].Index)
+					if err != nil {
+						allSame = false
+						break
+					}
+					if prev.Index != logs[i].Index || prev.Term != logs[i].Term {
+						allSame = false
+						missIn, missPrev = logs[i].Term, prev.Term
+						break
+					}
+					if len(prev.Data) > 0 && !bytes.Equal(prev.Data, logs[i].Data) {
+						allSame = false
+						missIn, missPrev = logs[i].Term, prev.Term
+						break
+					}
+				}
+				if allSame {
+					if int(overlap) >= len(logs) {
+						// 整批都是已落盘内容的幂等重投 ⇒ no-op 成功
+						return nil
+					}
+					// 剥掉重叠前缀, 只追加真正新的尾巴
+					logs = logs[overlap:]
+				} else {
+					return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole (overlap content mismatch: incoming term=%d stored term=%d)",
+						want-1, got, len(logs), missIn, missPrev)
+				}
+			} else {
+				return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole",
+					want-1, got, len(logs))
+			}
 		}
 	}
 	for i := 1; i < len(logs); i++ {
@@ -969,7 +1053,7 @@ func (s *Store) commitBatch(logs []*raft.Log, lsns []uint64, baseOff int64, buf 
 		if s.first == 0 {
 			s.first = l.Index
 		}
-		recLen := int64(binary.LittleEndian.Uint32(buf[recOff : recOff+4])) + 4
+		recLen := int64(binary.LittleEndian.Uint32(buf[recOff:recOff+4])) + 4
 		s.logs = append(s.logs, l)
 		s.offsets = append(s.offsets, baseOff+recOff)
 		if s.opts.SparseIndex && lsns[i] != 0 {
@@ -1115,6 +1199,28 @@ func (s *Store) FirstIndex() (uint64, error) {
 	return s.first, nil
 }
 
+// peekLogMetaLocked 读回既有条目的【内存态】元数据(已持 s.mu, 读或写)。
+// 与 GetLog 的区别: 不做 ref 模式的 redo.log 合并(那会走 redoIoMu 移交,
+// 持写锁者不可用) —— ref 条目返回 Data=nil。供 StoreLogs 的幂等重写比对用。
+func (s *Store) peekLogMetaLocked(index uint64) (raft.Log, error) {
+	if s.first == 0 || index < s.first {
+		return raft.Log{}, raft.ErrLogNotFound
+	}
+	off := index - s.first
+	if off >= uint64(len(s.logs)) {
+		return raft.Log{}, raft.ErrLogNotFound
+	}
+	if got := s.logs[off].Index; got != index {
+		return raft.Log{}, fmt.Errorf("filestore: hole detected: peekLogMeta(%d) maps to entry %d (first=%d len=%d): %w",
+			index, got, s.first, len(s.logs), raft.ErrLogNotFound)
+	}
+	l := *s.logs[off]
+	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
+		l.Data = nil // ref 指针形态: 内容在 redo.log, 此处不展开
+	}
+	return l, nil
+}
+
 func (s *Store) LastIndex() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1143,12 +1249,27 @@ func (s *Store) DeleteRange(min, max uint64) error {
 	}
 	last := s.lastIndexLocked()
 
+	// ★#106(2026-09-26): min > last 时**无事可做** —— 要删的区间整个在日志之后。
+	// 与上面 `max < s.first`(区间整个在日志之前)对称, 同样返回 nil。
+	//
+	// 这条守卫同时堵掉一个**越界读**: 下面是位置算术 keep = min - first, 当
+	// min > last 时 keep > len(logs)。原代码在这里写了 `if keep > len(s.logs) { keep = len(s.logs) }`
+	// —— 它只把**切片上界**夹住了, 紧接着的 `truncAt := s.offsets[keep]` 仍用夹住后的
+	// 值索引, 于是 offsets[len] 越界 panic(index out of range [20] with length 20,
+	// 复现: 建 [10,29] 后 DeleteRange(40,45))。那个 clamp 是**假保护**: 它让这行
+	// 看起来被保护了, 实际上漏掉了真正会被索引的那一个。
+	//
+	// 走的是公共接口(LogStore.DeleteRange), 参数又来自外部 —— 一旦越界就是整个
+	// 存储进程被 panic 带走, 与"一次非法删除"的代价完全不成比例。
+	if min > last {
+		return nil
+	}
+
 	// 后缀删除(冲突截断): 现有廉价截断路径。
 	if min > s.first {
+		// 由上面的 min <= last 得 keep = min-first <= last-first = len-1,
+		// 故 offsets[keep] 必定在界内(不再需要 clamp —— 见上)。
 		keep := int(min - s.first)
-		if keep > len(s.logs) {
-			keep = len(s.logs)
-		}
 		// raft 语义上 max==last; 若调用方给了更小的 max(中段删除 —— raft 的
 		// 两个调用点(压实/冲突)都不会这样用), 防御性回落到打包重写, 绝不误删
 		// (max, last] 的存活条目。
@@ -1404,20 +1525,22 @@ type Stats struct {
 	RedoHoleBytes   int64  `json:"redoHoleBytes,omitempty"`   // #163: bytes covered by healed holes
 
 	// J5 绑定速率观测(进程累计计数, 速率由读方取窗口差分)。
-	RedoDirectSegs  uint64 `json:"redoDirectSegs,omitempty"`  // WriteRedoDirect 成功发布段数
-	RedoBoundSegs   uint64 `json:"redoBoundSegs,omitempty"`   // raft meta 首次绑定段数(建 lsnIndex 时刻)
-	RedoBoundBytes  int64  `json:"redoBoundBytes,omitempty"`  // 绑定段承载的负载字节数
-	RedoUnboundBytes int64 `json:"redoUnboundBytes,omitempty"` // P3 未绑定水位(当前值 gauge)
+	RedoDirectSegs   uint64 `json:"redoDirectSegs,omitempty"`   // WriteRedoDirect 成功发布段数
+	RedoBoundSegs    uint64 `json:"redoBoundSegs,omitempty"`    // raft meta 首次绑定段数(建 lsnIndex 时刻)
+	RedoBoundBytes   int64  `json:"redoBoundBytes,omitempty"`   // 绑定段承载的负载字节数
+	RedoUnboundBytes int64  `json:"redoUnboundBytes,omitempty"` // P3 未绑定水位(当前值 gauge)
 }
 
 // J5 泄漏修复(9.24): 未绑定水位的配对记账。生命周期按事件驱动:
-//   ① reserve(lsn, n): WriteRedoDirect 阶段1 每次"新代"预留登记(直发重写
-//     场景同 LSN 多代共存, 各代各自挂账, 现金是全部代之和)。
-//   ② 终点事件即清账: 绑定(storeLogsRef 建 lsnIndex)、重写替代(direct/
-//     storeLogsRef 发布新代前)、压实丢弃(lsn<keepFrom) —— 任一终点发生
-//     即 unboundDrain 整条清账(旧代+新代), 后续再投递 no-op。
-//   ③ 失败即回滚: 占位/写盘失败按本次预留量 unboundRelease 退还。
-//   不变式: 现金 unboundBytes 恒 = Σ台账, Stats 照旧读现金。
+//
+//	① reserve(lsn, n): WriteRedoDirect 阶段1 每次"新代"预留登记(直发重写
+//	  场景同 LSN 多代共存, 各代各自挂账, 现金是全部代之和)。
+//	② 终点事件即清账: 绑定(storeLogsRef 建 lsnIndex)、重写替代(direct/
+//	  storeLogsRef 发布新代前)、压实丢弃(lsn<keepFrom) —— 任一终点发生
+//	  即 unboundDrain 整条清账(旧代+新代), 后续再投递 no-op。
+//	③ 失败即回滚: 占位/写盘失败按本次预留量 unboundRelease 退还。
+//	不变式: 现金 unboundBytes 恒 = Σ台账, Stats 照旧读现金。
+//
 // 台账随进程存亡: reloadRef 从 redo 扫描重建(等价于把盘上未绑定记录重新
 // reserve); DeleteRange 清 lsnIndex 时一并清台账; CompactRedo 换 map 时
 // 同步清掉丢弃者的台账。
@@ -1550,17 +1673,20 @@ func (s *Store) DiagRedoLsnSample(limit int) []uint64 {
 
 // DiagUnboundAudit 是 J5 泄漏的精确对账(只读诊断)。盘上未绑定记录分三类,
 // 现金只对第一类负责:
-//   ledgered = 台账在册且盘上有字节 —— 正常绑定滞后, cash 应 = Σ其记录全长。
-//     盘上字节比台账短的部分(同 LSN 更短新代已占盘)计入 over(多记账, 现金
-//     按旧代全长持有而盘上已无该字节)。
-//   missing  = 盘上有字节、未绑定(lsnIndex 无)、台账无账 —— 残留类。来源:
-//     DeleteRange(快照截断/日志压实)清 lsnIndex 绑定而不清 redo 字节; 兜底
-//     分支(重载时误判已绑定)。现金无需对它负责 —— 该类字节会在下一次
-//     CompactRedo 时被 GC(keepFrom 之下)并同步清账, 或重启 reloadRef 重新
-//     reserve 归入正常类。>0 恒表示"有等待回收的化石", 不漂移现金。
-//   orphan   = 台账在册而 redoMap 已无字节(账悬空) —— 严格异常, 计数。
+//
+//	ledgered = 台账在册且盘上有字节 —— 正常绑定滞后, cash 应 = Σ其记录全长。
+//	  盘上字节比台账短的部分(同 LSN 更短新代已占盘)计入 over(多记账, 现金
+//	  按旧代全长持有而盘上已无该字节)。
+//	missing  = 盘上有字节、未绑定(lsnIndex 无)、台账无账 —— 残留类。来源:
+//	  DeleteRange(快照截断/日志压实)清 lsnIndex 绑定而不清 redo 字节; 兜底
+//	  分支(重载时误判已绑定)。现金无需对它负责 —— 该类字节会在下一次
+//	  CompactRedo 时被 GC(keepFrom 之下)并同步清账, 或重启 reloadRef 重新
+//	  reserve 归入正常类。>0 恒表示"有等待回收的化石", 不漂移现金。
+//	orphan   = 台账在册而 redoMap 已无字节(账悬空) —— 严格异常, 计数。
+//
 // 离线重扫口径(全盘未绑定) = ledgeredDisk + missing; 现金对账恒等式:
-//   cash == Σ(ledgered 记录全长) - over  (多代残账经终点事件清账后应恒成立)。
+//
+//	cash == Σ(ledgered 记录全长) - over  (多代残账经终点事件清账后应恒成立)。
 func (s *Store) DiagUnboundAudit() (cash, ledgeredDisk, over, missing int64, orphanLsns []uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

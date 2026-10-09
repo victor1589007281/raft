@@ -231,8 +231,24 @@ START:
 	peer = s.peer
 	s.peerLock.RUnlock()
 
-	// Setup the request
-	if err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); err == ErrLogNotFound {
+	// Setup the request.
+	//
+	// ★#105-B(2026-09-25): 这里原为 `err == ErrLogNotFound` —— **身份比较**。而
+	// filestore.GetLog 在「位置算术命中了别的条目」时(索引空洞, 见 filestore.go 的
+	// hole detected 分支)是 `fmt.Errorf("... : %w", raft.ErrLogNotFound)` **包装**返回的。
+	// 包装后的 error 与哨兵不是同一个值, 身份比较为假 ⇒ 取不到日志**只走到
+	// `else if err != nil { return }`**, SEND_SNAP 永远不可达。
+	//
+	// 后果(实测, logdb-tps 41k 表档, 2026-09-25): 一个索引空洞让领导者每轮都在同一个
+	// 索引上重试 fail-loud, 快照回退这条**唯一的自愈路径**被哨兵错配挡在门外, 而 raft
+	// 又无法自己制造缺失的那一条 ⇒ 复制永久冻结, commit 停在空洞之下, 调用侧
+	// ApplyRedoBatchBase 在 commit 上无界等待(见 LogDBStorage raft_node.go 的退避修复)。
+	// 现场读数: s0 的 raft.log 只有 17 条(18716–18732)而 commit=18765、lastIdx=18732,
+	// 日志里每秒 ~2 行 `raft: failed to get log: index=18714 error="log not found"`。
+	//
+	// errors.Is 对**未包装的哨兵**与身份比较逐字节等价(哨兵本身既是链头也是链尾),
+	// 因此这条改动对「GetLog 直接返回哨兵」这一通常路径零行为差异, 只把包装形态一并认下。
+	if err := r.setupAppendEntries(s, &req, atomic.LoadUint64(&s.nextIndex), lastIndex); errors.Is(err, ErrLogNotFound) {
 		goto SEND_SNAP
 	} else if err != nil {
 		return

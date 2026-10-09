@@ -81,8 +81,18 @@ func (s *Store) WriteRedoDirect(base, lsn uint64, payload []byte) error {
 					s.unboundDrain(lsn)
 				default:
 					if _, bound := s.lsnIndex[lsn]; bound {
-						s.mu.Unlock()
-						return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容真分叉(firstDiff=%d existLen=%d newLen=%d) —— fencing", lsn, diff, len(existing), len(payload))
+						// ★epoch 感知 fencing(默认让位; KEEP_OLD env 可回旧行为): 死代缓冲尾
+						// 让位于恢复后真历史 —— 审计双内容 FNV, 落下方未绑定重写(先整条清账)。
+						// 直发是 ⑩c 灌洞的主力路径, 洞解在此。
+						if fencingOverrideAll || (fencingOverrideLSN != 0 && fencingOverrideLSN == lsn) || !fencingKeepOld.Load() {
+							if s.opts.Logger != nil {
+								s.opts.Logger.Printf("[WARN] filestore: ★direct fencing 特赦生效 lsn=%d: 死代 %d 字节(fnv=%016x) 让位真历史 %d 字节(fnv=%016x), firstDiff=%d", lsn, len(existing), fnv1a64(existing), len(payload), fnv1a64(payload), diff)
+							}
+							s.unboundDrain(lsn)
+						} else {
+							s.mu.Unlock()
+							return fmt.Errorf("filestore: direct lsn=%d 与已绑定内容真分叉(firstDiff=%d existLen=%d newLen=%d) —— fencing", lsn, diff, len(existing), len(payload))
+						}
 					}
 					if s.opts.Logger != nil {
 						s.opts.Logger.Printf("[WARN] filestore: direct lsn=%d 未绑定异字节重写(故障切换修复) (existLen=%d newLen=%d firstDiff=%d)", lsn, len(existing), len(payload), diff)

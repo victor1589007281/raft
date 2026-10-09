@@ -772,7 +772,7 @@ func TestRefConcurrentReadWriteCompact(t *testing.T) {
 				}
 				// 尾部的读: 允许成功或 ErrLogNotFound, 不允许其他错误。
 				var tl raft.Log
-				if err := s.GetLog(last + 1, &tl); err != nil && err != raft.ErrLogNotFound {
+				if err := s.GetLog(last+1, &tl); err != nil && err != raft.ErrLogNotFound {
 					select {
 					case errCh <- fmt.Errorf("GetLog(tail %d): %w", last+1, err):
 					default:

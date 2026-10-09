@@ -7,12 +7,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
-	"io"
-	"sync"
 
 	"github.com/hashicorp/raft"
 )
@@ -512,6 +512,7 @@ func (m *mockFSM) Apply(l *raft.Log) interface{} {
 	m.logs = append(m.logs, l)
 	return nil
 }
+
 // appliedLogs 返回已应用日志快照(读方与 raft FSM goroutine 的 Apply 并发,
 // 必须经同一把 mu —— 直接读 m.logs 字段会被 -race 抓到)。
 func (m *mockFSM) appliedLogs() []*raft.Log {
@@ -531,10 +532,11 @@ func (s *mockSnap) Release()                        {}
 // TestDiagUnboundAuditLifecycle: J5 对账恒等式全生命周期锁定 —— 直发→绑定→
 // 重写→再绑定→DeleteRange 解绑→压实 六个事件后的 cash/over/missing 语义。
 // 锁定的不变式:
-//   ① cash == ledgeredDisk − over 恒成立(任何事件后)。
-//   ② 绑定/重写终点后 missing == 0(终点事件即清账, 无残留)。
-//   ③ DeleteRange 解绑后 missing = 被解绑记录全长(化石类, 现金不动)。
-//   ④ 压实 GC 掉化石字节并同步清账 → missing 归零, 现金不变。
+//
+//	① cash == ledgeredDisk − over 恒成立(任何事件后)。
+//	② 绑定/重写终点后 missing == 0(终点事件即清账, 无残留)。
+//	③ DeleteRange 解绑后 missing = 被解绑记录全长(化石类, 现金不动)。
+//	④ 压实 GC 掉化石字节并同步清账 → missing 归零, 现金不变。
 func TestDiagUnboundAuditLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "logs"), refOpts())
