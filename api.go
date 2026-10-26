@@ -268,6 +268,7 @@ type Raft struct {
 	RestoreCommittedLogs bool
 }
 
+// BootstrapCluster 用给定成员配置把一块空白存储初始化为新集群的创世状态, 只应调用一次。
 // BootstrapCluster initializes a server's storage with the given cluster
 // configuration. This should only be called at the beginning of time for the
 // cluster with an identical configuration listing all Voter servers. There is
@@ -280,6 +281,19 @@ type Raft struct {
 // One approach is to bootstrap a single server with a configuration
 // listing just itself as a Voter, then invoke AddVoter() on it to add other
 // servers to the cluster.
+//
+// 算法解读：
+//
+//	原理：先校验 Config 与成员配置, 再用 HasExistingState 确认存储为空, 然后写入
+//	      currentTerm=1, 并在 index=1/term=1 落一条配置日志条目(协议 <3 用已废弃的
+//	      LogRemovePeerDeprecated 编码 peer 列表, 否则用 LogConfiguration)。
+//	关键不变量：index=1 的配置条目就是集群的创世提交点 —— 它让所有节点在日志起点
+//	      上有一致的配置视图。因此只能由**一台** Voter 执行 bootstrap, 且配置里要列
+//	      全所有 Voter; Nonvoter/Staging 不需要列(它们靠 AddVoter/AddNonvoter 加入)。
+//	代价与边界：一次 SetUint64 + 一次 StoreLog, 与集群规模无关; 存储非空时直接返回
+//	      ErrCantBootstrap(可安全忽略), 不会覆盖既有状态, 也不写 term 之外的任何东西。
+//	设计权衡：不在 bootstrap 里做选举或写更多状态, 把"创世"压缩成一次最小写入,
+//	      让 NewRaft 的通用恢复路径可以原样复用, 不必为首次启动写特例分支。
 func BootstrapCluster(conf *Config, logs LogStore, stable StableStore,
 	snaps SnapshotStore, trans Transport, configuration Configuration,
 ) error {
@@ -326,6 +340,7 @@ func BootstrapCluster(conf *Config, logs LogStore, stable StableStore,
 	return nil
 }
 
+// RecoverCluster 在丢失多数派、现有配置无法恢复时, 用操作者给定的配置强制重建本节点状态。
 // RecoverCluster is used to manually force a new configuration in order to
 // recover from a loss of quorum where the current configuration cannot be
 // restored, such as when several servers die at the same time. This works by
@@ -354,6 +369,20 @@ func BootstrapCluster(conf *Config, logs LogStore, stable StableStore,
 // leader, this can be used to inject a new configuration with that server as
 // the sole voter, and then join up other new clean-state peer servers using
 // the usual APIs in order to bring the cluster back into a known state.
+//
+// 算法解读：
+//
+//	原理：校验配置 → 要求**已有**状态 → 从新到旧打开并 Restore 快照 → 把快照之后
+//	      的日志条目(只重放 LogCommand, 配置条目跳过)应用到 FSM → 以
+//	      lastIndex/lastTerm + 新配置在 index=1 处造一份新快照 → DeleteRange 清空日志。
+//	关键不变量：本操作**隐式提交日志中的所有条目** —— 提交信息已随多数派一起丢失,
+//	      lastIndex 是唯一可用的上界, 因此它会把"在途但未提交"的条目一并提交, 只能
+//	      用于灾难恢复。传入的 FSM 会被留在不可再用的状态(它已被快照/回放改写),
+//	      必须丢弃, 之后调用 NewRaft 时给一个全新的实例。
+//	代价与边界：每个候选快照都要完整流式恢复一次, 再逐条 GetLog + Apply 回放尾部;
+//	      所有快照都打不开则报错, 快照 index/term 为 0 也被当作"未恢复"(0 是哨兵值)。
+//	设计权衡：不往日志里插入新条目(那会与其他节点的日志冲突), 而是"写新快照 + 截断
+//	      日志" —— 让各节点用相同配置独立恢复后自然选出 leader, 不需要额外的协调。
 func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	snaps SnapshotStore, trans Transport, configuration Configuration,
 ) error {
@@ -426,6 +455,8 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 		snapshotTerm = snapshot.Term
 		break
 	}
+	// 0 是"没有任何快照恢复成功"的哨兵值 —— 真实快照的 index/term 从 1 起算,
+	// 所以这里不需要额外的 bool 标记。
 	if len(snapshots) > 0 && (snapshotIndex == 0 || snapshotTerm == 0) {
 		return fmt.Errorf("failed to restore any of the available snapshots")
 	}
@@ -440,6 +471,8 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	if err != nil {
 		return fmt.Errorf("failed to find last log: %v", err)
 	}
+	// 只重放 LogCommand: 配置条目已经由下面新建的快照携带, 重放它们会让 FSM
+	// 经历一串中间态的成员变更。
 	for index := snapshotIndex + 1; index <= lastLogIndex; index++ {
 		var entry Log
 		if err = logs.GetLog(index, &entry); err != nil {
@@ -483,12 +516,14 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	return nil
 }
 
+// GetConfiguration 不启动 Raft 实例、也不连集群, 直接读出已持久化的集群配置。
 // GetConfiguration returns the persisted configuration of the Raft cluster
 // without starting a Raft instance or connecting to the cluster. This function
 // has identical behavior to Raft.GetConfiguration.
 func GetConfiguration(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	snaps SnapshotStore, trans Transport,
 ) (Configuration, error) {
+	// 只借用 NewRaft 的恢复路径读配置, 不起 run/runFSM/runSnapshots 任何后台 goroutine。
 	conf.skipStartup = true
 	r, err := NewRaft(conf, fsm, logs, stable, snaps, trans)
 	if err != nil {
@@ -501,8 +536,22 @@ func GetConfiguration(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	return future.Configuration(), nil
 }
 
+// HasExistingState 判断本节点是否已有任何持久状态(term / 日志 / 快照), 供 bootstrap 与 recover 的判据使用。
 // HasExistingState returns true if the server has any existing state (logs,
 // knowledge of a current term, or any snapshots).
+//
+// 算法解读：
+//
+//	原理：三项独立探测 —— stable 里的 currentTerm>0、log store 的 LastIndex>0、
+//	      snapshot store 的 List 非空; 任一命中即"有状态"。
+//	关键不变量：判据是**短路 OR**, 所以任何一项"读失败"都必须返回错误而不是当成
+//	      false —— 把读不到误判成没有, 会让 BootstrapCluster 覆盖掉真实数据。
+//	代价与边界：依赖 `err.Error() != "not found"` 这个字符串哨兵来区分"键不存在"
+//	      (StableStore 的约定)与真实 I/O 错误; 哨兵文案一旦被实现方改动, 两种语义
+//	      就会互换 —— 这是本函数最脆的一环。
+//	设计权衡：只做只读探测、不做任何修复, 把"空 vs 非空"的解释权留给调用方:
+//	      bootstrap 要求空(否则 ErrCantBootstrap), recover 要求非空(否则拒绝, 逼操作者
+//	      显式表达"我要新建集群"而不是静默起一个空集群)。
 func HasExistingState(logs LogStore, stable StableStore, snaps SnapshotStore) (bool, error) {
 	// Make sure we don't have a current term.
 	currentTerm, err := stable.GetUint64(keyCurrentTerm)
@@ -511,6 +560,8 @@ func HasExistingState(logs LogStore, stable StableStore, snaps SnapshotStore) (b
 			return true, nil
 		}
 	} else {
+		// "not found" 是 StableStore 对"键不存在"的约定文案; 其余错误都是真实 I/O 失败,
+		// 必须上报而不是当成"没有 term"。
 		if err.Error() != "not found" {
 			return false, fmt.Errorf("failed to read current term: %v", err)
 		}
@@ -537,10 +588,30 @@ func HasExistingState(logs LogStore, stable StableStore, snaps SnapshotStore) (b
 	return false, nil
 }
 
+// NewRaft 构造一个 Raft 节点, 并在返回前从磁盘恢复 term、末条日志、快照与配置。
 // NewRaft is used to construct a new Raft node. It takes a configuration, as well
 // as implementations of various interfaces that are required. If we have any
 // old state, such as snapshots, logs, peers, etc, all those will be restored
 // when creating the Raft node.
+//
+// 算法解读：
+//
+//	原理：校验配置 → 读 currentTerm/lastIndex/lastLog → 构造 Raft 结构体(所有
+//	      channel 与原子量就位) → 置 Follower 态 → restoreSnapshot() 恢复最新快照并
+//	      推进 lastApplied/lastSnapshot 与 latest/committed 配置 →
+//	      restoreFromCommittedLogs()(可选)按存储记录的 commitIndex 直接推进 →
+//	      #163 幻影校验截断不可读的日志尾 → 从 max(快照, lastApplied)+1 扫到
+//	      lastLog.Index 收集配置条目 → 注册心跳快路径 → 起三个后台 goroutine。
+//	关键不变量：返回前 lastLog 必须与 log store 的真实可读高度一致 —— 否则
+//	      appendEntries 的 prev-log 检查(r.lastLog)会永久拒绝, 领导者永不自我截断,
+//	      复制卡死(commit=0 死锁家族)。幻影校验正是为此: 它把 store 截断到最高连续
+//	      可读位, 让领导者按 prevLog 重铺(与 follower 冲突截断同构)。
+//	代价与边界：幻影校验与配置扫描各是 O(未应用尾部) 次 GetLog, 启动成本与尾部长度
+//	      成正比而非与整个日志成正比; 被截断的幻影条目若在其它节点上仍存在, 会由
+//	      领导者重新推回来, 因此截断是安全的(不会丢已提交数据)。
+//	设计权衡：把自愈放在启动路径而不是每次 appendEntries 里 —— 一次性付 O(尾部) 的
+//	      代价, 换来复制热路径上零额外检查; 且旧实现只会在下方的配置扫描 panic 里
+//	      暴露问题(重启必炸), 现在是"告警 + 自愈"而不是崩溃。
 func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps SnapshotStore, trans Transport) (*Raft, error) {
 	// Validate the configuration.
 	if err := ValidateConfig(conf); err != nil {
@@ -552,6 +623,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 
 	// Try to restore the current term.
 	currentTerm, err := stable.GetUint64(keyCurrentTerm)
+	// "not found" 表示全新节点(还没有 term), 不是错误; 其余错误必须上报。
 	if err != nil && err.Error() != "not found" {
 		return nil, fmt.Errorf("failed to load current term: %v", err)
 	}
@@ -577,11 +649,14 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 
 	// TODO (slackpad) - When we deprecate protocol version 2, remove this
 	// along with the AddPeer() and RemovePeer() APIs.
+	// 协议 v2 及以前没有独立的 ServerID 概念, 直接用网络地址充当 ID。
 	if protocolVersion < 3 && string(localID) != string(localAddr) {
 		return nil, fmt.Errorf("when running with ProtocolVersion < 3, LocalID must be set to the network address")
 	}
 
 	// Buffer applyCh to MaxAppendEntries if the option is enabled
+	// 缓冲深度取 MaxAppendEntries: 主循环忙(攒批/落盘)时调用方仍能入队, 上限与一批
+	// 最多能装的条目数同量级; 不开 BatchApplyCh 时是无缓冲 channel, 入队即同步交棒。
 	applyCh := make(chan *logFuture)
 	if conf.BatchApplyCh {
 		applyCh = make(chan *logFuture, conf.MaxAppendEntries)
@@ -590,8 +665,10 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	_, transportSupportPreVote := trans.(WithPreVote)
 	// Create Raft struct.
 	r := &Raft{
-		protocolVersion:       protocolVersion,
-		applyCh:               applyCh,
+		protocolVersion: protocolVersion,
+		applyCh:         applyCh,
+		// 64 是异步持久化队列的深度: 写满时 dispatchLogs(leader 主循环)会在发送处
+		// 阻塞, 形成反压, 避免"未落盘的批次"无界堆积 —— 代价是存储卡顿时主循环也停摆。
 		asyncWriteCh:          make(chan asyncWrite, 64),
 		asyncPersistErrCh:     make(chan struct{}, 1),
 		fsm:                   fsm,
@@ -620,9 +697,11 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		leaderNotifyCh:        make(chan struct{}, 1),
 		followerNotifyCh:      make(chan struct{}, 1),
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
-		preVoteDisabled:       conf.PreVoteDisabled || !transportSupportPreVote,
-		noLegacyTelemetry:     conf.NoLegacyTelemetry,
-		RestoreCommittedLogs:  conf.RestoreCommittedLogs,
+		// transport 未实现 WithPreVote 时强制关闭 pre-vote —— 否则会在没有对端支持的
+		// 集群里发出没人能应答的预投票请求。
+		preVoteDisabled:      conf.PreVoteDisabled || !transportSupportPreVote,
+		noLegacyTelemetry:    conf.NoLegacyTelemetry,
+		RestoreCommittedLogs: conf.RestoreCommittedLogs,
 	}
 	if !transportSupportPreVote && !conf.PreVoteDisabled {
 		r.logger.Warn("pre-vote is disabled because it is not supported by the Transport")
@@ -708,6 +787,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	return r, nil
 }
 
+// verifyLogTailContiguous 校验 [from, lastIndex] 在 log store 中逐条连续可读, 返回最高连续可读位与断点错误。
 // verifyLogTailContiguous checks that [from, lastIndex] is contiguous and
 // readable in the log store (12.14.9 #163 lastLog 幻影校验). Returns the
 // highest contiguous readable index (≥ from-1) and, if lastIndex itself is
@@ -715,11 +795,26 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 // range is readable. Cost is one GetLog per entry in the range — at startup
 // this is bounded by the unapplied tail, and the config scan below walks the
 // same range anyway.
+//
+// 算法解读：
+//
+//	原理：从 from 起对区间内每个 index 调一次 GetLog, 一旦某条读不到就立即返回
+//	      index-1 与该错误; 全部读到则返回 lastIndex 与 nil。
+//	关键不变量：返回的"最高连续可读位"必须是**从 from 起连续**的 —— 区间中间只要
+//	      有一个空洞, 上界就停在空洞的前一位, 而不是"最大的可读 index"。调用方
+//	      据此把 store 截断到该位, 让领导者从断点重铺。
+//	代价与边界：O(区间长度) 次 GetLog(随机读); lastIndex==0 或 from>lastIndex 时
+//	      直接返回(空区间视为连续); from<1 时被夹到 1 —— 否则 `index - 1` 会在
+//	      uint64 上回绕成 2^64-1。
+//	设计权衡：选择"逐条读"而不是"信 LastIndex" —— LastIndex 只报告存储自己的水位,
+//	      发现不了水位之内被静默截断/覆写的空洞(那正是幻影的来源); 而启动路径本来
+//	      就要为配置扫描再走一遍同一区间, 所以这次校验的额外成本近似为零。
 func verifyLogTailContiguous(logs LogStore, lastIndex, from uint64) (uint64, error) {
 	if lastIndex == 0 || from > lastIndex {
 		return lastIndex, nil
 	}
 	if from < 1 {
+		// 夹到 1: 否则下面的 `index - 1` 会在 uint64 上下溢回绕。
 		from = 1
 	}
 	var entry Log
@@ -731,9 +826,27 @@ func verifyLogTailContiguous(logs LogStore, lastIndex, from uint64) (uint64, err
 	return lastIndex, nil
 }
 
+// restoreSnapshot 在初始化时按"从新到旧"尝试恢复快照, 一个都恢复不了才报错; 其它时刻调用都不安全。
 // restoreSnapshot attempts to restore the latest snapshots, and fails if none
 // of them can be restored. This is called at initialization time, and is
 // completely unsafe to call at any other time.
+//
+// 算法解读：
+//
+//	原理：List() 已按 index 降序(最新在前)返回快照, 逐个用
+//	      tryRestoreSingleSnapshot 尝试; 第一个成功的即定案 —— 推进 lastApplied 与
+//	      lastSnapshot, 再按快照版本决定配置来源: v>0 用快照自带的
+//	      Configuration/ConfigurationIndex, v0 用 decodePeers 解 Peers 并把 index
+//	      取作快照自身的 index。
+//	关键不变量：恢复成功后 lastApplied 必须**跳到快照 index**, 否则启动后会把快照
+//	      已经包含的日志再重放一遍(FSM 不幂等时就是双重应用)。配置与水位必须来自
+//	      同一个 snapshot, 不能把 A 快照的配置配上 B 快照的 index。
+//	代价与边界：每个候选快照都要完整流式恢复一次, 失败的尝试已经把 FSM 写脏 ——
+//	      这正是"只能在初始化时调用"的原因(此刻 FSM 还是全新的, 脏了也无所谓)。
+//	      有快照但一个都恢复不了 → 报错, 不会静默当成空集群启动。
+//	设计权衡：先试最新的(最新的意味着最少的日志回放), 失败再退旧的; 而不是挑
+//	      "最小的"或"校验和最好的" —— 快照列表本身就是一条按 index 排好的候选序列,
+//	      最新的合法快照就是最优解。
 func (r *Raft) restoreSnapshot() error {
 	snapshots, err := r.snapshots.List()
 	if err != nil {
@@ -780,7 +893,27 @@ func (r *Raft) restoreSnapshot() error {
 	return nil
 }
 
+// tryRestoreSingleSnapshot 尝试恢复单个快照: 成功返回 true, 打开或恢复失败则记日志并返回 false。
+//
+// 注意返回值表达的是"这个快照已被**处理**", 而不是"FSM 真的被恢复了": 配置了
+// NoSnapshotRestoreOnStart 时函数直接返回 true 却什么都没做 —— 调用方
+// restoreSnapshot 会据此把 lastApplied/lastSnapshot 推进到该快照的 index。
+// 这是给"FSM 自己从私有存储恢复"的用法留的口子, 此时水位推进是刻意的。
+//
+// 算法解读：
+//
+//	原理：NoSnapshotRestoreOnStart 直接短路; 否则打开快照流, 经
+//	      fsmRestoreAndMeasure 包装后交给 fsm.Restore, 无论成败都关闭 source。
+//	关键不变量：返回 true 的两种含义(真恢复了 / 按配置跳过)被调用方统一当作"已处理",
+//	      所以跳过模式下 FSM 是空的但 lastApplied 已被推到快照 index —— 这要求 FSM
+//	      自己已经把状态恢复好了, 否则就是静默的数据空洞。
+//	代价与边界：一次全量流式 Restore; 失败不返回错误、只返回 false 并把原因写进日志,
+//	      由调用方在"所有快照都失败"时统一报错, 因此单个失败原因不会向上冒泡。
+//	设计权衡：用 bool 而不是 error 返回, 让调用方的"退到下一个快照"逻辑保持简单,
+//	      代价是失败细节只留在日志里(排障时要看日志才知道为什么某个快照被跳过)。
 func (r *Raft) tryRestoreSingleSnapshot(snapshot *SnapshotMeta) bool {
+	// 跳过恢复但仍返回 true: 让 restoreSnapshot 继续把水位推进到该快照, FSM 的状态
+	// 由应用自己负责。
 	if r.config().NoSnapshotRestoreOnStart {
 		return true
 	}
@@ -812,7 +945,22 @@ func (r *Raft) tryRestoreSingleSnapshot(snapshot *SnapshotMeta) bool {
 	return true
 }
 
+// restoreFromCommittedLogs 在开启 RestoreCommittedLogs 时按存储记录的 commitIndex 直接推进提交位并重放日志。
 // restoreFromCommittedLogs recovers the Raft node from committed logs.
+//
+// 算法解读：
+//
+//	原理：若 log store 实现了 CommitTrackingLogStore, 就读出它持久化的 commitIndex,
+//	      夹取到 LastIndex 以内, setCommitIndex 后调 processLogs 把该 index 之前的
+//	      条目一次性喂给 FSM。
+//	关键不变量：commitIndex 必须 ≤ 本地 LastIndex —— 存储里的提交点可能高于本节点
+//	      实际持有的日志(该节点曾落后或被截断过), 不夹取会让 processLogs 走到读不到
+//	      的 index 上。
+//	代价与边界：走通这条路, 启动重放量从"整个日志"降到"已提交但未应用的那一段";
+//	      但前提是 log store 真的把 commitIndex 落了盘, 否则返回 ErrIncompatibleLogStore
+//	      (先记 warning, 不静默降级)。
+//	设计权衡：用类型断言 + 显式报错, 而不是"读不到就当 0" —— 静默退回 0 会让 FSM 在
+//	      已提交数据上缺一段, 属于最难查的一类不一致; 宁可让调用方看见不支持。
 func (r *Raft) restoreFromCommittedLogs() error {
 	if !r.RestoreCommittedLogs {
 		return nil
@@ -837,6 +985,8 @@ func (r *Raft) restoreFromCommittedLogs() error {
 		r.logger.Error("failed to get last log index from store", "error", err)
 		return err
 	}
+	// 存储记录的提交点可能高于本节点实际持有的日志(本节点曾落后/被截断),
+	// 夹取到 LastIndex, 否则 processLogs 会去读不存在的 index。
 	if commitIndex > lastIndex {
 		commitIndex = lastIndex
 	}
@@ -846,15 +996,18 @@ func (r *Raft) restoreFromCommittedLogs() error {
 	return nil
 }
 
+// config 返回当前生效的 Config 快照; conf 是 atomic.Value, 任意 goroutine 都可安全调用。
 func (r *Raft) config() Config {
 	return r.conf.Load().(Config)
 }
 
+// ReloadConfig 用 ReloadableConfig 热更运行中节点的配置; 校验失败则报错并保持原配置不变。
 // ReloadConfig updates the configuration of a running raft node. If the new
 // configuration is invalid an error is returned and no changes made to the
 // instance. All fields will be copied from rc into the new configuration, even
 // if they are zero valued.
 func (r *Raft) ReloadConfig(rc ReloadableConfig) error {
+	// 加锁覆盖"读旧配置 → apply → Store"整段读改写, 否则两个并发热更会互相丢字段。
 	r.confReloadMu.Lock()
 	defer r.confReloadMu.Unlock()
 
@@ -871,6 +1024,8 @@ func (r *Raft) ReloadConfig(rc ReloadableConfig) error {
 	r.conf.Store(newCfg)
 
 	if rc.HeartbeatTimeout < oldCfg.HeartbeatTimeout {
+		// 只有**变短**才需要通知: 复制循环/心跳定时器用的是"当时读到的"超时, 变长会
+		// 自然在下一次重排时生效, 变短则必须立刻打断当前这一轮等待。
 		// On leader, ensure replication loops running with a longer
 		// timeout than what we want now discover the change.
 		asyncNotifyCh(r.leaderNotifyCh)
@@ -880,6 +1035,7 @@ func (r *Raft) ReloadConfig(rc ReloadableConfig) error {
 	return nil
 }
 
+// ReloadableConfig 读出当前可热更字段的状态, 供程序上报或测试观察; 任意 goroutine 可调用。
 // ReloadableConfig returns the current state of the reloadable fields in Raft's
 // configuration. This is useful for programs to discover the current state for
 // reporting to users or tests. It is safe to call from any goroutine. It is
@@ -893,6 +1049,7 @@ func (r *Raft) ReloadableConfig() ReloadableConfig {
 	return rc
 }
 
+// BootstrapCluster 是包级 BootstrapCluster 的实例内版本, 可在 NewRaft 之后对尚未 bootstrap 的节点调用。
 // BootstrapCluster is equivalent to non-member BootstrapCluster but can be
 // called on an un-bootstrapped Raft instance after it has been created. This
 // should only be called at the beginning of time for the cluster with an
@@ -918,6 +1075,7 @@ func (r *Raft) BootstrapCluster(configuration Configuration) Future {
 	}
 }
 
+// Leader 返回当前集群 leader 的地址(已废弃, 用 LeaderWithID 代替); 无 leader 或未知时返回空串。
 // Leader is used to return the current leader of the cluster.
 // Deprecated: use LeaderWithID instead
 // It may return empty string if there is no current leader
@@ -930,6 +1088,7 @@ func (r *Raft) Leader() ServerAddress {
 	return leaderAddr
 }
 
+// LeaderWithID 返回当前集群 leader 的地址与 ID, 无 leader 或未知时返回两个空串。
 // LeaderWithID is used to return the current leader address and ID of the cluster.
 // It may return empty strings if there is no current leader
 // or the leader is unknown.
@@ -941,6 +1100,7 @@ func (r *Raft) LeaderWithID() (ServerAddress, ServerID) {
 	return leaderAddr, leaderID
 }
 
+// Apply 把一条命令以强一致方式交给 FSM, 返回可等待的 ApplyFuture, 必须在 leader 上调用。
 // Apply is used to apply a command to the FSM in a highly consistent
 // manner. This returns a future that can be used to wait on the application.
 // An optional timeout can be provided to limit the amount of time we wait
@@ -956,17 +1116,49 @@ func (r *Raft) LeaderWithID() (ServerAddress, ServerID) {
 // If a user snapshot is restored while the command is in-flight, an
 // ErrAbortedByRestore is returned. In this case the write effectively failed
 // since its effects will not be present in the FSM after the restore.
+//
+// 算法解读：
+//
+//	原理：只是 ApplyLog(Log{Data: cmd}, timeout) 的转发 —— 命令被包成 LogCommand
+//	      条目投进 applyCh, 由 leader 主循环追加日志、复制、提交, 提交后 runFSM 把它
+//	      喂给 FSM 并 respond 该 future。
+//	关键不变量：future 被 respond 意味着"已提交并已交给 FSM", 但失败语义不对称 ——
+//	      提交后被罢黜返回 ErrLeadershipLost, 此时写成功与否**无法判定**(至少一个
+//	      follower 可能已落盘并在下一任期存活); 用户快照在命令在途时被恢复则返回
+//	      ErrAbortedByRestore, 此时写等效失败(恢复后 FSM 里没有它的效果)。
+//	代价与边界：timeout 只限制"入队"耗时(applyCh 满或主循环忙), 不限制提交与应用的
+//	      耗时 —— 超时返回 ErrEnqueueTimeout 时命令**可能已经在跑**; timeout<=0 表示
+//	      不设超时。
+//	设计权衡：返回 future 而不是同步阻塞, 把"等多久、超时后如何处置不确定性"交给
+//	      调用方 —— 库无法替应用决定一次不确定的写该重试还是该放弃。
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return r.ApplyLog(Log{Data: cmd}, timeout)
 }
 
+// ApplyLog 与 Apply 相同, 但直接接收一个 Log; 当前只取其中的 Data 与 Extensions 字段。
 // ApplyLog performs Apply but takes in a Log directly. The only values
 // currently taken from the submitted Log are Data and Extensions. See
 // Apply for details on error cases.
+//
+// 算法解读：
+//
+//	原理：计一个 raft.apply 指标 → timeout>0 时起 time.After 定时器 → 构造
+//	      logFuture(Type=LogCommand, 只搬运 Data/Extensions, Index/Term 留空待填) →
+//	      在 timer / shutdownCh / applyCh 三者间 select。
+//	关键不变量：只有 `applyCh <- logFuture` 那条分支返回的是"真"future, 另外两条返回
+//	      的是已 respond 的 errorFuture —— 也就是说"返回时就知道失败"与"返回后
+//	      Error() 才非 nil"是两条不同的失败路径, 调用方两种都必须查 Error()。
+//	代价与边界：Index/Term 不在调用方侧赋值, 而由主循环 append 时填 —— 保证 index
+//	      的分配只发生在一个地方(主循环), 不会与并发 Apply 竞态。非 leader 上投进来的
+//	      future 由主循环以 ErrNotLeader 拒绝(领导权移交中则是
+//	      ErrLeadershipTransferInProgress), 所以"是否 leader"只在主循环判定一次。
+//	设计权衡：把 leader 检查推迟到主循环而不是在入口先查 —— 入口查完再投递之间存在
+//	      窗口(TOCTOU), 检查与动作必须在同一个 goroutine 里才有意义。
 func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 	metrics.IncrCounter([]string{"raft", "apply"}, 1)
 
 	var timer <-chan time.Time
+	// timeout<=0 表示不设超时: timer 保持 nil, select 的该分支永远不就绪。
 	if timeout > 0 {
 		timer = time.After(timeout)
 	}
@@ -991,11 +1183,24 @@ func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 	}
 }
 
+// Barrier 投递一条屏障条目并阻塞到它之前的所有操作都已应用到 FSM; 必须在 leader 上调用。
 // Barrier is used to issue a command that blocks until all preceding
 // operations have been applied to the FSM. It can be used to ensure the
 // FSM reflects all queued writes. An optional timeout can be provided to
 // limit the amount of time we wait for the command to be started. This
 // must be run on the leader, or it will fail.
+//
+// 算法解读：
+//
+//	原理：与 ApplyLog 同构, 只是条目类型为 LogBarrier —— 它没有 Data, 不产生 FSM
+//	      副作用, 但同样要走追加/复制/提交/应用整条链路。
+//	关键不变量：屏障保证的是"**本节点 FSM 的 lastApplied** 越过了该条目"; 它不保证
+//	      其它节点的应用进度, 也不等于数据已 fsync(除非异步持久化关闭)。
+//	代价与边界：一次完整的日志往返(与一条空命令同价), 不是免费的本地栅栏; timeout
+//	      同样只限制入队, 不限制提交与应用。
+//	设计权衡：复用日志路径而不是发明一条本地栅栏消息 —— 本地栅栏无法区分"已入队"
+//	      与"已应用", 也无法在 leader 切换后给出正确语义(屏障必须与它保护的写
+//	      经过同一条顺序化通道)。
 func (r *Raft) Barrier(timeout time.Duration) Future {
 	metrics.IncrCounter([]string{"raft", "barrier"}, 1)
 	var timer <-chan time.Time
@@ -1017,6 +1222,7 @@ func (r *Raft) Barrier(timeout time.Duration) Future {
 	}
 }
 
+// VerifyLeader 通过一次 quorum 往返确认本节点仍是 leader, 用来避免在失去领导权后返回过期的 FSM 数据。
 // VerifyLeader is used to ensure this peer is still the leader. It may be used
 // to prevent returning stale data from the FSM after the peer has lost
 // leadership.
@@ -1032,6 +1238,7 @@ func (r *Raft) VerifyLeader() Future {
 	}
 }
 
+// ReadConsistency 是读路径的一致性档位: 用网络往返换新鲜度, 档位越高数据越新、延迟越大。
 // ReadConsistency selects the consistency tier used by VerifyReadIndex. The
 // tiers trade network round trips against freshness: higher tiers return more
 // recent data but cost more latency. See planning-read 12.2 for the design and
@@ -1056,6 +1263,7 @@ const (
 	ReadStale
 )
 
+// String 返回该档位的稳定名称(strict/lease/stale), 供诊断与 vraftd 控制面使用。
 // String returns the stable name of the tier, for diagnostics and the vraftd
 // control plane.
 func (rc ReadConsistency) String() string {
@@ -1071,12 +1279,32 @@ func (rc ReadConsistency) String() string {
 	}
 }
 
+// VerifyReadIndex 是读路径的统一入口: 按给定档位返回"读到该 index 为止是安全的"水位, 档位无法满足时报错。
 // VerifyReadIndex is the unified read-path entry point (planning-read 12.2.2).
 // It returns the index watermark up to which the caller's FSM read is safe, or
 // an error when the requested tier cannot be satisfied (e.g. ReadStrict on a
 // non-leader, or a lost leadership during the quorum round). The caller is
 // responsible for ensuring the FSM is applied at least to the returned index
 // before reading (e.g. FSM Barrier) and for actually performing the read.
+//
+// 算法解读：
+//
+//	原理：三档分派 —— ReadStale 直接返回本地 lastApplied(任何节点可用, 含只读副本);
+//	      ReadLease 在 leaderLeaseValid() 为真时返回本地 commitIndex(零网络往返),
+//	      否则 fallthrough 到 ReadStrict; ReadStrict 先做一次 quorum 往返
+//	      (VerifyLeader)确认自己仍是 leader, 再把当前 commitIndex 作为线性一致水位。
+//	关键不变量：返回的水位必须**先于**读操作被 FSM 追上 —— 调用方有责任保证 FSM 至少
+//	      应用到该 index(例如先 Barrier)再读, 否则会读到比水位更旧的状态。ReadStrict
+//	      之所以线性一致, 是因为 quorum 往返证明了"往返期间本节点仍被多数派认可":
+//	      任何在往返之前已完成的写, 其 commitIndex 必然已被包含在这次读到的值里;
+//	      反之, 若本节点已被罢黜, 往返期间多数派必然已经选出了新 leader, 校验就会失败。
+//	代价与边界：ReadStrict 一次 RTT(最强最慢); ReadLease 零 RTT, 租约边界上的陈旧度
+//	      由时钟偏移预算界定(12.2.3) —— 租约失效时不报错而是**降级**到 strict, 所以
+//	      ReadLease 永远不会返回比 ReadStrict 更弱的结果, 只可能更慢。ReadStale 完全
+//	      不检查领导权, 可以返回任意陈旧的数据, 其新鲜度就是返回的 applied index 本身。
+//	设计权衡：只返回水位、不代做读 —— 读的是应用自己的 FSM, 库无从知道该读什么; 另外
+//	      lease 档用 fallthrough 复用 strict 分支而不是另写一份, 保证降级路径与 strict
+//	      档**共用同一段校验代码**, 不会出现两条逐渐漂移的实现。
 func (r *Raft) VerifyReadIndex(consistency ReadConsistency) (uint64, error) {
 	switch consistency {
 	case ReadStale:
@@ -1091,6 +1319,9 @@ func (r *Raft) VerifyReadIndex(consistency ReadConsistency) (uint64, error) {
 		if r.leaderLeaseValid() {
 			return r.getCommitIndex(), nil
 		}
+		// 租约不可靠时**降级**而不是报错: 落到下面的 ReadStrict 分支做一次 quorum 往返。
+		// 注意这里没有单独的 lease 指标 —— 降级后的这次读会被记成 strict, 是刻意的
+		// (它确实付了一次 RTT)。
 		fallthrough
 
 	case ReadStrict:
@@ -1107,6 +1338,7 @@ func (r *Raft) VerifyReadIndex(consistency ReadConsistency) (uint64, error) {
 	}
 }
 
+// GetConfiguration 返回最新配置(可能尚未提交); 直接读原子快照 latestConfiguration, 任意 goroutine 可调用。
 // GetConfiguration returns the latest configuration. This may not yet be
 // committed. The main loop can access this directly.
 func (r *Raft) GetConfiguration() ConfigurationFuture {
@@ -1117,6 +1349,7 @@ func (r *Raft) GetConfiguration() ConfigurationFuture {
 	return configReq
 }
 
+// AddPeer 把一个网络地址作为投票者加入集群配置(协议 v3+ 不支持), 必须在 leader 上调用。
 // AddPeer to the cluster configuration. Must be run on the leader, or it will fail.
 //
 // Deprecated: Use AddVoter/AddNonvoter instead.
@@ -1137,6 +1370,7 @@ func (r *Raft) AddPeer(peer ServerAddress) Future {
 // removed, it will cause a new election to occur. Must be run on the leader,
 // or it will fail.
 
+// RemovePeer 从集群配置中移除一个网络地址(协议 v3+ 不支持), 必须在 leader 上调用; 移除的是当前 leader 会触发新一轮选举。
 // Deprecated: Use RemoveServer instead.
 func (r *Raft) RemovePeer(peer ServerAddress) Future {
 	if r.protocolVersion > 2 {
@@ -1150,6 +1384,7 @@ func (r *Raft) RemovePeer(peer ServerAddress) Future {
 	}, 0)
 }
 
+// AddVoter 把给定 server 作为 staging 成员加入集群(leader 会在它就绪后自动转正), 已存在则只更新地址。
 // AddVoter will add the given server to the cluster as a staging server. If the
 // server is already in the cluster as a voter, this updates the server's address.
 // This must be run on the leader or it will fail. The leader will promote the
@@ -1171,6 +1406,7 @@ func (r *Raft) AddVoter(id ServerID, address ServerAddress, prevIndex uint64, ti
 	}, timeout)
 }
 
+// AddNonvoter 把给定 server 以非投票成员加入集群: 它接收日志, 但不参与选举与提交; 已存在则只更新地址。
 // AddNonvoter will add the given server to the cluster but won't assign it a
 // vote. The server will receive log entries, but it won't participate in
 // elections or log entry commitment. If the server is already in the cluster,
@@ -1189,16 +1425,31 @@ func (r *Raft) AddNonvoter(id ServerID, address ServerAddress, prevIndex uint64,
 	}, timeout)
 }
 
+// AddLearner 把给定 server 作为 learner(不投票的成员)加入集群, 是带显式 learner 语义的 AddNonvoter 别名。
 // AddLearner adds the given server as a learner: a non-voting member that
 // receives log entries (and, if far behind, a snapshot) but neither votes nor
 // participates in commit. It is an alias for AddNonvoter with explicit learner
 // semantics (planning-elasticity 12.5.3): adding a member without a vote never
 // drags the commit quorum, so expansion does not degrade availability. Promote
 // the learner with PromoteToVoter once it has caught up.
+//
+// 算法解读：
+//
+//	原理：直接转发到 AddNonvoter(prevIndex, timeout) —— 差别只在语义命名: 调用方用
+//	      learner 表达"先扩容、后晋升"的两步意图。
+//	关键不变量：加入的成员**不带投票权**, 因此不进入 quorum 分母 —— 扩容期间(新节点
+//	      还落后)不会把提交所需的多数派门槛抬高, 可用性不下降。prevIndex 非零时,
+//	      若其间已有别的配置条目落地, 本次变更会失败(乐观并发控制, 防止基于过期配置
+//	      做成员变更)。
+//	代价与边界：learner 仍要接收全量日志(落后太远时收快照), 带宽与磁盘开销与 voter
+//	      相同, 它只是不参与投票; prevIndex=0 表示不做版本检查。
+//	设计权衡：不做成"直接 AddVoter + 内部等追平"的一步操作 —— 那在追平期间就已经把
+//	      新节点计入 quorum, 而那段窗口正是扩容最容易掉可用性的时候。
 func (r *Raft) AddLearner(id ServerID, address ServerAddress, prevIndex uint64, timeout time.Duration) IndexFuture {
 	return r.AddNonvoter(id, address, prevIndex, timeout)
 }
 
+// PromoteToVoter 把一个 learner 晋升为正式投票者: 先等它追平 leader 的日志, 再追加 AddVoter 配置条目。
 // PromoteToVoter promotes an existing learner (or any non-voting member) to a
 // full voter (planning-elasticity 12.5.3). It waits until the server has caught
 // up to the leader's log — its confirmed matched index reaches the leader's
@@ -1207,6 +1458,22 @@ func (r *Raft) AddLearner(id ServerID, address ServerAddress, prevIndex uint64, 
 // configuration change is committed, or fails on timeout / leadership loss /
 // server absent from the configuration. A server that is already a voter
 // resolves immediately with the current commit index.
+//
+// 算法解读：
+//
+//	原理：先用线程安全的配置快照做成员与投票权预检(id 不存在立即失败、已是 voter 立即
+//	      以当前 commitIndex 返回), 然后在后台 goroutine 里 waitForLearnerCatchUp
+//	      轮询, 追平后调 AddVoter 追加配置条目, 由返回的 future 承接最终结果。
+//	关键不变量：追平判据是 **leader 侧确认的 matched ≥ leader 的 lastIndex**, 而不是
+//	      "learner 自称收到了" —— 只有 leader 的复制状态才能作为晋升依据。追平严格早于
+//	      晋升, 所以晋升那一刻新 voter 已持有全部已提交条目, 不会因为进入 quorum 而
+//	      拖慢提交。
+//	代价与边界：预检读的是 latest 配置(可能尚未提交), 因此存在"预检通过但真正 AddVoter
+//	      时该成员已被移除"的窗口 —— 那种情况由 AddVoter 自身返回错误。timeout 只约束
+//	      "等待追平"这一段: 后续的 AddVoter 以 0(不设超时)传入, 不再受它限制。
+//	设计权衡：把轮询封在库内而不是让调用方自己反复 GetConfiguration —— "是否追平"只有
+//	      leader 主线程知道(要读 replState.matched), 暴露出去只会诱使调用方把它误实现
+//	      成"看 lastIndex 差值"。
 func (r *Raft) PromoteToVoter(id ServerID, timeout time.Duration) IndexFuture {
 	// Pre-check membership and suffrage against the thread-safe configuration
 	// snapshot so we fail fast on a bogus id.
@@ -1223,6 +1490,7 @@ func (r *Raft) PromoteToVoter(id ServerID, timeout time.Duration) IndexFuture {
 			address = s.Address
 			if s.Suffrage == Voter {
 				// Already a full voter: nothing to promote.
+				// 已经是 voter 时立即完成: 不报错, 也无需等待追平(它本来就在 quorum 里)。
 				return &resolvedIndexFuture{index: r.getCommitIndex()}
 			}
 			break
@@ -1235,12 +1503,16 @@ func (r *Raft) PromoteToVoter(id ServerID, timeout time.Duration) IndexFuture {
 	fut := &promotionFuture{}
 	fut.ShutdownCh = r.shutdownCh
 	fut.init()
+	// 追平是阻塞式轮询(最长可达整个 timeout), 必须放到后台 goroutine, 否则会把
+	// 调用方(通常是控制面)卡死。
 	r.goFunc(func() {
 		if err := r.waitForLearnerCatchUp(id, timeout); err != nil {
 			fut.respond(err)
 			return
 		}
 		// Learner caught up to the leader: promote it to a voting member.
+		// AddVoter 的 prevIndex/timeout 都传 0: 不做配置版本检查, 且超时预算已经被
+		// 追平阶段用掉了 —— 配置条目本身入队不再设超时。
 		addFuture := r.AddVoter(id, address, 0, 0)
 		if err := addFuture.Error(); err != nil {
 			fut.respond(err)
@@ -1252,14 +1524,33 @@ func (r *Raft) PromoteToVoter(id ServerID, timeout time.Duration) IndexFuture {
 	return fut
 }
 
+// waitForLearnerCatchUp 轮询 leader 主线程, 直到 learner 的 confirmed matched 追平 leader 末条日志、超时或领导权丢失。
 // waitForLearnerCatchUp polls the leader's main thread until the learner's
 // confirmed matched index reaches the leader's last log index, the timeout
 // expires, or leadership is lost. Each poll is a single catchupCheckFuture
 // resolved by leaderLoop; polls are spaced a few ms apart so the leader's
 // replication work is not starved.
+//
+// 算法解读：
+//
+//	原理：每轮构造一个 catchupCheckFuture 投进 catchupCh, 由 leader 主循环把
+//	      replState[id].matched 与 r.getLastIndex() 比较后 respond; caughtUp 为真
+//	      即返回 nil, 否则 sleep 10ms 再试。
+//	关键不变量：判据是 `matched >= leader 的 lastIndex`(含未提交尾部), 比"已提交"更强 ——
+//	      晋升后的新 voter 立刻具备成为 leader 的日志完整度。轮询必须走主线程
+//	      (catchupCh), 因为 replState 只在主线程可变; 10ms 间隔是为了不让轮询把复制
+//	      工作饿死。
+//	代价与边界：timeout>0 时按墙钟 deadline 判超时; **timeout<=0 表示永不超时**, 此时
+//	      只能靠 shutdown 或领导权丢失(主循环以 ErrNotLeader 响应)退出, 调用方给 0 要
+//	      自己承担"一直等下去"的风险。非 leader 上每次 poll 都立即返回 ErrNotLeader,
+//	      不会空转。
+//	设计权衡：用轮询而不是让 leader 在 matched 变化时主动通知 —— 通知需要在复制热路径
+//	      上挂回调或条件变量, 而追平是低频运维动作, 10ms 粒度完全够用, 轮询把复杂度
+//	      留在了冷路径上。
 func (r *Raft) waitForLearnerCatchUp(id ServerID, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
+		// timeout<=0 时不做超时判断(deadline 无意义), 循环只由 shutdown / 领导权丢失终止。
 		if timeout > 0 && time.Now().After(deadline) {
 			return fmt.Errorf("raft: learner %s did not catch up to the leader within %s", id, timeout)
 		}
@@ -1271,12 +1562,14 @@ func (r *Raft) waitForLearnerCatchUp(id ServerID, timeout time.Duration) error {
 			return ErrRaftShutdown
 		case r.catchupCh <- check:
 		}
+		// 非 leader(或没有该 server 的复制状态)时, 主循环以 error 响应, 立即失败而不是空转。
 		if err := check.Error(); err != nil {
 			return err
 		}
 		if check.caughtUp {
 			return nil
 		}
+		// 10ms 轮询间隔: 追平是低频动作, 太密会把 leader 主循环的复制工作挤掉。
 		select {
 		case <-time.After(10 * time.Millisecond):
 		case <-r.shutdownCh:
@@ -1285,6 +1578,7 @@ func (r *Raft) waitForLearnerCatchUp(id ServerID, timeout time.Duration) error {
 	}
 }
 
+// RemoveServer 从集群配置中移除给定 server; 移除的是当前 leader 时会触发新一轮选举, 必须在 leader 上调用。
 // RemoveServer will remove the given server from the cluster. If the current
 // leader is being removed, it will cause a new election to occur. This must be
 // run on the leader or it will fail. For prevIndex and timeout, see AddVoter.
@@ -1300,6 +1594,7 @@ func (r *Raft) RemoveServer(id ServerID, prevIndex uint64, timeout time.Duration
 	}, timeout)
 }
 
+// DemoteVoter 收回给定 server 的投票权(若它本来就有): 之后它仍收日志, 但不参与选举与提交。
 // DemoteVoter will take away a server's vote, if it has one. If present, the
 // server will continue to receive log entries, but it won't participate in
 // elections or log entry commitment. If the server is not in the cluster, this
@@ -1317,6 +1612,7 @@ func (r *Raft) DemoteVoter(id ServerID, prevIndex uint64, timeout time.Duration)
 	}, timeout)
 }
 
+// Shutdown 停止 Raft 的全部后台例程; 这不是优雅停机, 返回的 future 可等到所有例程退出。
 // Shutdown is used to stop the Raft background routines.
 // This is not a graceful operation. Provides a future that
 // can be used to block until all background routines have exited.
@@ -1324,6 +1620,8 @@ func (r *Raft) Shutdown() Future {
 	r.shutdownLock.Lock()
 	defer r.shutdownLock.Unlock()
 
+	// 幂等: 只有第一次调用才真正 close(shutdownCh)(重复 close 会 panic); 后续调用
+	// 返回的 future 不持有 r, 因此 Error() 直接返回 nil, 也不会再关一次 transport。
 	if !r.shutdown {
 		close(r.shutdownCh)
 		r.shutdown = true
@@ -1335,6 +1633,7 @@ func (r *Raft) Shutdown() Future {
 	return &shutdownFuture{nil}
 }
 
+// Snapshot 手动触发一次快照, 返回的 future 可等待完成, 并带有打开该快照的函数。
 // Snapshot is used to manually force Raft to take a snapshot. Returns a future
 // that can be used to block until complete, and that contains a function that
 // can be used to open the snapshot.
@@ -1350,6 +1649,7 @@ func (r *Raft) Snapshot() SnapshotFuture {
 	}
 }
 
+// Restore 手动让 Raft 消费一份外部快照(例如从备份恢复); 只能在 leader 上调用, 并阻塞到完成或出错。
 // Restore is used to manually force Raft to consume an external snapshot, such
 // as if restoring from a backup. We will use the current Raft configuration,
 // not the one from the snapshot, so that we can restore into a new cluster. We
@@ -1364,6 +1664,20 @@ func (r *Raft) Snapshot() SnapshotFuture {
 // install snapshot process. This involves a potentially dangerous period where
 // the leader commits ahead of its followers, so should only be used for disaster
 // recovery into a fresh cluster, and should not be used in normal operations.
+//
+// 算法解读：
+//
+//	原理：把 userRestoreFuture 投进 userRestoreCh 并等它完成(由 FSM 侧执行真正的
+//	      Restore 并重建快照); 随后再投一条 LogNoop 并等它提交 —— 后者起屏障作用:
+//	      它证明 follower 也已经拿到并装上了这份快照, 而不只是 leader 自己换了状态。
+//	关键不变量：配置取**当前**的而不是快照里的, 新状态点取 max(快照 index, 当前 index)+1
+//	      —— 故意在日志里造一个空洞, 使快照只能经 install snapshot 路径推给 follower
+//	      与新加入者, 而不能靠日志复制补齐。这个"leader 提交点跑到 follower 前面"的
+//	      窗口正是它只能用于灾难恢复的原因。
+//	代价与边界：两次等待共用同一个 timeout, 而 timer 是**一次性**的 —— 恢复阶段用掉的
+//	      时间会从 noop 阶段的预算里扣掉, 不是每阶段各一份预算。恢复本身是流式全量读。
+//	设计权衡：不在"快照已安装"就返回, 而要再等一条 noop 提交 —— 否则调用方以为恢复
+//	      完成时 follower 可能还没装上, leader 一旦失效集群就会回退到旧状态。
 func (r *Raft) Restore(meta *SnapshotMeta, reader io.Reader, timeout time.Duration) error {
 	metrics.IncrCounter([]string{"raft", "restore"}, 1)
 	var timer <-chan time.Time
@@ -1399,6 +1713,7 @@ func (r *Raft) Restore(meta *SnapshotMeta, reader io.Reader, timeout time.Durati
 		},
 	}
 	noop.init()
+	// 注意 timer 是上面那一个(一次性): 恢复阶段已经花掉了一部分预算, 两个阶段不是各一份。
 	select {
 	case <-timer:
 		return ErrEnqueueTimeout
@@ -1409,11 +1724,13 @@ func (r *Raft) Restore(meta *SnapshotMeta, reader io.Reader, timeout time.Durati
 	}
 }
 
+// State 返回本节点的当前状态(Follower/Candidate/Leader/Shutdown)。
 // State returns the state of this raft peer.
 func (r *Raft) State() RaftState {
 	return r.getState()
 }
 
+// LeaderCh 返回一个在获得/失去领导权时收到通知的 channel(true=成为 leader, false=失去)。
 // LeaderCh is used to get a channel which delivers signals on acquiring or
 // losing leadership. It sends true if we become the leader, and false if we
 // lose it.
@@ -1429,11 +1746,13 @@ func (r *Raft) LeaderCh() <-chan bool {
 	return r.leaderCh
 }
 
+// String 返回本 Raft 节点的可读描述(本地地址与当前状态)。
 // String returns a string representation of this Raft node.
 func (r *Raft) String() string {
 	return fmt.Sprintf("Node at %s [%v]", r.localAddr, r.getState())
 }
 
+// LastContact 返回最近一次收到 leader 联系的时间, 只在当前是 follower 时才有意义。
 // LastContact returns the time of last contact by a leader.
 // This only makes sense if we are currently a follower.
 func (r *Raft) LastContact() time.Time {
@@ -1443,6 +1762,7 @@ func (r *Raft) LastContact() time.Time {
 	return last
 }
 
+// Stats 返回一组内部统计量的字符串映射, 只用于观测与排障, 不构成任何保证。
 // Stats is used to return a map of various internal stats. This
 // should only be used for informative purposes or debugging.
 //
@@ -1511,6 +1831,8 @@ func (r *Raft) Stats() map[string]string {
 				}
 			}
 		}
+		// 本节点不在配置里(已被移出)时 num_peers 报 0 —— 这是保留下来的遗留语义,
+		// 免得下游误以为"还有 N 个对端"。
 		if !hasUs {
 			numPeers = 0
 		}
@@ -1528,17 +1850,20 @@ func (r *Raft) Stats() map[string]string {
 	return s
 }
 
+// CurrentTerm 返回当前任期。
 // CurrentTerm returns the current term.
 func (r *Raft) CurrentTerm() uint64 {
 	return r.getCurrentTerm()
 }
 
+// LastIndex 返回稳定存储中的最后 index, 取日志末条与快照两者中的较大者。
 // LastIndex returns the last index in stable storage,
 // either from the last log or from the last snapshot.
 func (r *Raft) LastIndex() uint64 {
 	return r.getLastIndex()
 }
 
+// CommitIndex 返回已提交的 index; 可用于实现 Raft 论文里的 read index 读优化。
 // CommitIndex returns the committed index.
 // This API maybe helpful for server to implement the read index optimization
 // as described in the Raft paper.
@@ -1546,6 +1871,7 @@ func (r *Raft) CommitIndex() uint64 {
 	return r.getCommitIndex()
 }
 
+// AppliedIndex 返回最后一条**投递给** FSM 的 index; 这不代表 FSM 已消费完它, 应用状态可能更旧。
 // AppliedIndex returns the last index applied to the FSM. This is generally
 // lagging behind the last index, especially for indexes that are persisted but
 // have not yet been considered committed by the leader. NOTE - this reflects
@@ -1557,6 +1883,7 @@ func (r *Raft) AppliedIndex() uint64 {
 	return r.getLastApplied()
 }
 
+// LeadershipTransfer 把领导权移交给集群中的某个 server; 只能在 leader 上调用, 否则会失败。
 // LeadershipTransfer will transfer leadership to a server in the cluster.
 // This can only be called from the leader, or it will fail. The leader will
 // stop accepting client requests, make sure the target server is up to date
@@ -1577,6 +1904,7 @@ func (r *Raft) LeadershipTransfer() Future {
 	return r.initiateLeadershipTransfer(nil, nil)
 }
 
+// LeadershipTransferToServer 与 LeadershipTransfer 相同, 但由参数指定要移交给集群中的哪个 server。
 // LeadershipTransferToServer does the same as LeadershipTransfer but takes a
 // server in the arguments in case a leadership should be transitioned to a
 // specific server in the cluster.  Note that raft protocol version 3 is not

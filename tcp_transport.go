@@ -28,13 +28,16 @@ type HostnameAddr struct {
 	addr    string
 }
 
+// NewHostnameAddr 用 "host:port" 串构造 HostnameAddr, network 固定为 "tcp"。
 // NewHostnameAddr returns a HostnameAddr for the given "host:port" string.
 func NewHostnameAddr(addr string) *HostnameAddr {
 	return &HostnameAddr{network: "tcp", addr: addr}
 }
 
+// Network 返回该地址的网络类型, 固定为 "tcp"。
 func (h *HostnameAddr) Network() string { return h.network }
 
+// String 返回 "host:port" 形式的地址串 —— raft 配置里持久化的就是它, 所以它必须跨 pod 重建仍然有效。
 func (h *HostnameAddr) String() string { return h.addr }
 
 // TCPStreamLayer implements StreamLayer interface for plain TCP.
@@ -43,6 +46,8 @@ type TCPStreamLayer struct {
 	listener  *net.TCPListener
 }
 
+// NewTCPTransport 在 TCP 流层上建一个 NetworkTransport, 日志写 logOutput、池上限 maxPool、
+// I/O 超时 timeout, 12.8 的新开关一律取零值(关闭)。
 // NewTCPTransport returns a NetworkTransport that is built on top of
 // a TCP streaming transport layer.
 func NewTCPTransport(
@@ -57,6 +62,7 @@ func NewTCPTransport(
 	})
 }
 
+// NewTCPTransportWithLogger 同上, 但日志走调用方传入的 hclog.Logger 而不是裸 io.Writer。
 // NewTCPTransportWithLogger returns a NetworkTransport that is built on top of
 // a TCP streaming transport layer, with log output going to the supplied Logger
 func NewTCPTransportWithLogger(
@@ -71,6 +77,8 @@ func NewTCPTransportWithLogger(
 	})
 }
 
+// NewTCPTransportWithConfig 用完整配置结构建 transport; 建好后把刚创建的流层写回 config.Stream 再交给
+// NewNetworkTransportWithConfig。
 // NewTCPTransportWithConfig returns a NetworkTransport that is built on top of
 // a TCP streaming transport layer, using the given config struct.
 func NewTCPTransportWithConfig(
@@ -84,6 +92,8 @@ func NewTCPTransportWithConfig(
 	})
 }
 
+// newTCPTransport 是三个 NewTCPTransport* 的共同底座: 先 bind, 再把监听器包成 TCPStreamLayer,
+// 校验 advertise 地址可用后交给 transportCreator 建出 transport; 校验失败会关掉监听器并返回哨兵错误。
 func newTCPTransport(bindAddr string,
 	advertise net.Addr,
 	transportCreator func(stream StreamLayer) *NetworkTransport) (*NetworkTransport, error) {
@@ -123,21 +133,25 @@ func newTCPTransport(bindAddr string,
 	return trans, nil
 }
 
+// Dial 按 StreamLayer 接口拨一条出站 TCP 连接, 超时由 timeout 控制(不重试)。
 // Dial implements the StreamLayer interface.
 func (t *TCPStreamLayer) Dial(address ServerAddress, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("tcp", string(address), timeout)
 }
 
+// Accept 直接转发给底层 *net.TCPListener, 本身不做任何限流或超时。
 // Accept implements the net.Listener interface.
 func (t *TCPStreamLayer) Accept() (c net.Conn, err error) {
 	return t.listener.Accept()
 }
 
+// Close 关闭底层监听器, 使 listen 循环里的 Accept 返回错误并走退避。
 // Close implements the net.Listener interface.
 func (t *TCPStreamLayer) Close() (err error) {
 	return t.listener.Close()
 }
 
+// Addr 优先返回 advertise(对外宣告的地址), 未设置时才回落到实际绑定的监听地址。
 // Addr implements the net.Listener interface.
 func (t *TCPStreamLayer) Addr() net.Addr {
 	// Use an advertise addr if provided

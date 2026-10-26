@@ -75,18 +75,24 @@ type errorFuture struct {
 	err error
 }
 
+// Error 返回该 future 预置的静态错误, 立即返回、永不阻塞。
 func (e errorFuture) Error() error {
 	return e.err
 }
 
+// Response 恒返回 nil —— errorFuture 只承载错误, 没有 FSM 响应体。
 func (e errorFuture) Response() interface{} {
 	return nil
 }
 
+// Index 恒返回 0 —— 静态错误 future 不对应任何日志条目。
 func (e errorFuture) Index() uint64 {
 	return 0
 }
 
+// deferError 可嵌入到各类 future 中, 提供一个「稍后才有」的错误结果:
+// 结果由 respond 投递、由 Error 阻塞取回, Raft 关闭时以 ErrRaftShutdown 兜底。
+//
 // deferError can be embedded to allow a future
 // to provide an error in the future.
 type deferError struct {
@@ -96,10 +102,27 @@ type deferError struct {
 	ShutdownCh chan struct{}
 }
 
+// init 惰性创建 errCh, 必须在 Error / respond 之前调用。
+// 容量 1 是刻意的: 结果常常在等待方到来之前就已 respond(leaderLoop 先解 future
+// 再交接), 有缓冲才能让投递方不被尚未出现的等待方阻塞。
 func (d *deferError) init() {
 	d.errCh = make(chan error, 1)
 }
 
+// Error 阻塞直到 future 被 respond 或 Raft 关闭, 并把结果缓存进 d.err。
+// 结果一经取回即短路返回(重复调用返回同一个值); 接口约定同一实例不可并发调用。
+//
+// 算法解读：
+//
+//	原理：init 建一条容量 1 的 errCh, 主线程或复制 goroutine 通过 respond 投递
+//	  结果, 调用方在这里 select 等待「结果到达」与「进程关闭」两个事件。
+//	关键不变量：respond 必须幂等(responded 标志), 否则二次投递会 panic 在已关闭
+//	  的 channel 上; errCh 容量必须 >= 1, 否则「先 respond 后等待」的路径会把
+//	  投递方一起阻塞住。
+//	代价与边界：respond(nil) 不会被 `d.err != nil` 短路命中, 而是落到 select 上读
+//	  一条已关闭的 channel —— 依然立即返回 nil, 与缓存路径行为一致。
+//	设计权衡：用 channel 而不是 sync.Cond/WaitGroup, 因为调用方要同时等「结果」
+//	  与「关闭」两件事, select 天然表达这种二选一。
 func (d *deferError) Error() error {
 	if d.err != nil {
 		// Note that when we've received a nil error, this
@@ -118,6 +141,9 @@ func (d *deferError) Error() error {
 	return d.err
 }
 
+// respond 投递 future 的结果并关闭 errCh; 保证只生效一次(responded 幂等护栏)。
+// 在 init 之前调用或重复调用都是安全空操作 —— 这让「先 respond 再交接 future」
+// 的路径不必关心接收方是否已就绪。
 func (d *deferError) respond(err error) {
 	if d.errCh == nil {
 		return
@@ -154,10 +180,12 @@ type promotionFuture struct {
 	index uint64
 }
 
+// Index 返回 AddVoter 配置条目提交后的日志索引(提交前为 0)。
 func (p *promotionFuture) Index() uint64 {
 	return p.index
 }
 
+// Response 恒返回 nil —— 晋升不产生 FSM 响应。
 func (p *promotionFuture) Response() interface{} {
 	return nil
 }
@@ -168,14 +196,17 @@ type resolvedIndexFuture struct {
 	index uint64
 }
 
+// Error 恒返回 nil —— 该 future 在构造时结果即已确定。
 func (r *resolvedIndexFuture) Error() error {
 	return nil
 }
 
+// Response 恒返回 nil。
 func (r *resolvedIndexFuture) Response() interface{} {
 	return nil
 }
 
+// Index 返回构造时冻结的索引(服务器已是 voter 时, 即当时的 commit index)。
 func (r *resolvedIndexFuture) Index() uint64 {
 	return r.index
 }
@@ -189,6 +220,10 @@ type bootstrapFuture struct {
 	configuration Configuration
 }
 
+// logFuture 表示一次 Apply 或配置变更: 条目在日志中就位后由 leaderLoop 解出结果,
+// 提交之前 Error 一直阻塞; 领导权丢失或 Raft 关闭时分别以 ErrLeadershipLost /
+// ErrRaftShutdown 解出。
+//
 // logFuture is used to apply a log entry and waits until
 // the log is considered committed.
 type logFuture struct {
@@ -198,10 +233,12 @@ type logFuture struct {
 	dispatch time.Time
 }
 
+// Response 返回 FSM.Apply 的返回值; 必须在 Error 返回之后调用。
 func (l *logFuture) Response() interface{} {
 	return l.response
 }
 
+// Index 返回该条目在日志中的索引。
 func (l *logFuture) Index() uint64 {
 	return l.log.Index
 }
@@ -210,6 +247,7 @@ type shutdownFuture struct {
 	raft *Raft
 }
 
+// Error 阻塞至 Raft 完全停机, 并在 transport 实现 WithClose 时顺带关闭它。
 func (s *shutdownFuture) Error() error {
 	if s.raft == nil {
 		return nil
@@ -231,6 +269,9 @@ type userSnapshotFuture struct {
 	opener func() (*SnapshotMeta, io.ReadCloser, error)
 }
 
+// Open 打开用户快照, 返回其元数据与内容读取器; 只能成功取一次 ——
+// 取回后立即把 opener 置空, 防止重复打开(重复打开并不安全)。
+//
 // Open is a function you can call to access the underlying snapshot and its
 // metadata.
 func (u *userSnapshotFuture) Open() (*SnapshotMeta, io.ReadCloser, error) {
@@ -301,16 +342,23 @@ type configurationsFuture struct {
 	configurations configurations
 }
 
+// Configuration 返回 Raft 当前在用的最新配置(由 leaderLoop 主线程填好, 外部可安全读)。
+//
 // Configuration returns the latest configuration in use by Raft.
 func (c *configurationsFuture) Configuration() Configuration {
 	return c.configurations.latest
 }
 
+// Index 返回该最新配置对应的日志索引。
+//
 // Index returns the index of the latest configuration in use by Raft.
 func (c *configurationsFuture) Index() uint64 {
 	return c.configurations.latestIndex
 }
 
+// vote 为一次领导权校验投一票; 票数达到 quorum(或收到反对票)时唤醒等待方。
+// 每个 future 只唤醒一次: 投出后把 notifyCh 置 nil, 之后的票被直接丢弃。
+//
 // vote is used to respond to a verifyFuture.
 // This may block when responding on the notifyCh.
 func (v *verifyFuture) vote(leader bool) {
@@ -343,14 +391,17 @@ type appendFuture struct {
 	resp  *AppendEntriesResponse
 }
 
+// Start 返回该流水线请求发出的时刻, 用于统计 RPC 往返耗时。
 func (a *appendFuture) Start() time.Time {
 	return a.start
 }
 
+// Request 返回该流水线请求的 AppendEntries 参数。
 func (a *appendFuture) Request() *AppendEntriesRequest {
 	return a.args
 }
 
+// Response 返回该流水线请求收到的应答。
 func (a *appendFuture) Response() *AppendEntriesResponse {
 	return a.resp
 }

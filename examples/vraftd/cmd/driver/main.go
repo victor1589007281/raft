@@ -38,6 +38,8 @@ type benchResult struct {
 	Applied    uint64  `json:"fsm_applied_total"`
 }
 
+// getState 拉取某个 vraftd 的 /state 并解析; 任何一步失败(连不上、body 不是 JSON)
+// 都返回 nil, 让调用方把它当作"这个地址目前不可用"而不是致命错误。
 func getState(addr string) *stateResp {
 	resp, err := http.Get("http://" + addr + "/state")
 	if err != nil {
@@ -51,6 +53,22 @@ func getState(addr string) *stateResp {
 	return &s
 }
 
+// main 轮询所有目标地址直到发现 leader, 再把 /bench 请求 POST 给它并打印结果。
+//
+// 算法解读：
+//
+//	原理：集群里谁是 leader 只能问出来, 所以先做一段"发现"——每轮遍历全部地址,
+//	      谁自报 Role=="Leader" 就选谁; 找到即跳出, 一轮都没有就 sleep 1s 再来。
+//	      发现之后**只发一次** /bench, 因为基准本身跑在 vraftd 进程内, 驱动只负责
+//	      挑目标与展示数字。
+//	关键不变量：这里的耗时几乎全在 vraftd 侧, 驱动只做一次 HTTP 往返, 所以打印的
+//	      吞吐/延迟就是被观测节点自己测出来的值, 不含客户端网络开销。也正因为如此,
+//	      驱动不需要预热或多次取平均——重复运行要手动发起。
+//	代价与边界：180s 是"等一个集群选完主"的上限, 超时就退出而不是继续等;
+//	      探活失败与"不是 leader"被同样对待(都只是换个地址试), 所以集群全挂时
+//	      表现为 180s 后报 "no leader found", 而不是立刻报连接错误。
+//	设计权衡：不做负载生成、不做统计聚合, 把这两件事都留在 vraftd 内(那里才有
+//	      真正的定时器与写路径); 代价是这个驱动只能测 vraftd, 不能测任意 raft 服务。
 func main() {
 	var (
 		targets   = flag.String("targets", "", "comma-separated vraftd HTTP addresses")
@@ -67,6 +85,8 @@ func main() {
 	addrs := strings.Split(*targets, ",")
 
 	// Wait for a leader, probing all addresses.
+	// 180s 是"冷启动整个集群并等它选完主"的上限; 1s 轮询与 joinCluster 的节奏
+	// 一致, 也远小于它, 不会让驱动比集群自己还慢。
 	var leader string
 	deadline := time.Now().Add(180 * time.Second)
 	for time.Now().Before(deadline) {
@@ -115,6 +135,8 @@ func main() {
 
 	var res benchResult
 	if err := json.Unmarshal(raw, &res); err != nil {
+		// 200 但结构对不上(例如服务端换了字段)时把原始 body 打出来而不是
+		// 报错退出, 这样至少能看到对方到底回了什么。
 		fmt.Println(string(raw))
 		return
 	}

@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	minCheckInterval          = 10 * time.Millisecond
+	minCheckInterval          = 10 * time.Millisecond // 租约检查的最小间隔: 防止 checkInterval 被算成 0 或负数而忙等
 	oldestLogGaugeInterval    = 10 * time.Second
 	rpcUnexpectedCommandError = "unexpected command"
 )
@@ -30,6 +30,7 @@ var (
 	keyLastVoteCand = []byte("LastVoteCand")
 )
 
+// getRPCHeader 构造本节点的 RPCHeader(协议版本 + 本地 ID + 编码后的地址), 随每个 RPC 请求/响应一起发送。
 // getRPCHeader returns an initialized RPCHeader struct for the given
 // Raft instance. This structure is sent along with RPC requests and
 // responses.
@@ -41,6 +42,7 @@ func (r *Raft) getRPCHeader() RPCHeader {
 	}
 }
 
+// checkRPCHeader 校验入站 RPC 的协议版本是否可处理: 先看是否落在 [ProtocolVersionMin, ProtocolVersionMax] 内, 再看是否 >= 本节点配置版本-1(只向后兼容一个大版本)。
 // checkRPCHeader houses logic about whether this instance of Raft can process
 // the given RPC message.
 func (r *Raft) checkRPCHeader(rpc RPC) error {
@@ -71,6 +73,7 @@ func (r *Raft) checkRPCHeader(rpc RPC) error {
 	return nil
 }
 
+// getSnapshotVersion 返回当前协议版本下应使用的快照版本; 现有两个版本互相兼容, 故恒返回 1。
 // getSnapshotVersion returns the snapshot version that should be used when
 // creating snapshots, given the protocol version in use.
 func getSnapshotVersion(protocolVersion ProtocolVersion) SnapshotVersion {
@@ -97,6 +100,7 @@ type asyncWrite struct {
 	commitment *commitment // captured at dispatch; only used if still leader of w.term
 }
 
+// asyncStoreErr 返回导致异步持久化写者失败的错误; 未记录具体错误时回退为一个通用错误。
 // asyncStoreErr returns the error that caused the async persist writer to
 // fail, or a generic one if none is recorded.
 func (r *Raft) asyncStoreErr() error {
@@ -108,6 +112,7 @@ func (r *Raft) asyncStoreErr() error {
 	return fmt.Errorf("async log store failure")
 }
 
+// asyncStoreErrStore 记录使异步持久化写者停摆的错误(原子写, 供主线程读取)。
 // asyncStoreErrStore records the error that stopped the async persist writer.
 func (r *Raft) asyncStoreErrStore(err error) {
 	r.asyncWriteErr.Store(err)
@@ -130,6 +135,7 @@ type leaderState struct {
 	pendingNoop *logFuture
 }
 
+// setLeader 更新当前已知 leader 的地址与 ID, 并在两者任一变化时对外发出 LeaderObservation。
 // setLeader is used to modify the current leader Address and ID of the cluster
 func (r *Raft) setLeader(leaderAddr ServerAddress, leaderID ServerID) {
 	r.leaderLock.Lock()
@@ -143,6 +149,7 @@ func (r *Raft) setLeader(leaderAddr ServerAddress, leaderID ServerID) {
 	}
 }
 
+// requestConfigChange 把成员变更请求投递给主线程, 按 timeout 超时(<=0 表示不设超时); 关机中返回 ErrRaftShutdown。
 // requestConfigChange is a helper for the above functions that make
 // configuration change requests. 'req' describes the change. For timeout,
 // see AddVoter.
@@ -165,6 +172,7 @@ func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.
 	}
 }
 
+// run 是 Raft 的主线程循环: 按当前状态分派到 runFollower / runCandidate / runLeader, 关机时先清空 leader 再返回。
 // run the main thread that handles leadership and RPC requests.
 func (r *Raft) run() {
 	for {
@@ -188,9 +196,14 @@ func (r *Raft) run() {
 	}
 }
 
+// runFollower 跑 follower 状态的主循环: 处理入站 RPC, 拒绝一切写/配置/校验请求, 并在心跳超时后转为 candidate。
 // runFollower runs the main loop while in the follower state.
 func (r *Raft) runFollower() {
 	didWarn := false
+	// campaignDelayApplied 标记【本次 leader 失联周期】是否已经应用过 CampaignDelay。
+	// 只延迟一次: 延迟到期后即使仍未联系上 leader, 也会正常进入 candidate 选举,
+	// 因此该机制不可能永久推迟选举(可用性边界见 Config.CampaignDelay 注释)。
+	campaignDelayApplied := false
 	leaderAddr, leaderID := r.LeaderWithID()
 	r.logger.Info("entering follower state", "follower", r, "leader-address", leaderAddr, "leader-id", leaderID)
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
@@ -256,12 +269,33 @@ func (r *Raft) runFollower() {
 			heartbeatTimer = randomTimeout(hbTimeout)
 
 			// Check if we have had a successful contact
-			lastContact := r.LastContact()
+			lastContact := r.LastContact() // 只认心跳窗口内的联系: 距上次成功联系超过一个心跳超时即认为 leader 失联
 			if time.Since(lastContact) < hbTimeout {
+				// leader 又联系上了: 复位延迟标记, 下次真正失联时允许重新评估一次。
+				campaignDelayApplied = false
 				continue
 			}
 
 			// Heartbeat failed! Transition to the candidate state
+			// soft B: 前沿加权的候选延迟 —— 仅延迟、不拒绝。leader 失联时若调用方
+			// 声明需要延迟(例如本节点 redo 前沿落后, 让更新的节点先竞选), 则把心跳
+			// 定时器改为延迟到期, continue 回 select 继续处理入站 RPC/心跳; 延迟期间
+			// 若重新收到 leader 心跳, 上面的分支会复位标记, 不会竞选。
+			// 注意: 这里绝不 sleep 阻塞主循环, 也绝不阻止延迟到期后的正常选举。
+			if !campaignDelayApplied && r.config().CampaignDelay != nil {
+				d := r.config().CampaignDelay()
+				if d > 0 {
+					if d > 2*time.Second {
+						d = 2 * time.Second // 硬上限: 保证可用性, 最坏只多等 2s
+					}
+					campaignDelayApplied = true
+					metrics.IncrCounter([]string{"raft", "campaign", "delay_applied"}, 1)
+					r.logger.Info("delaying campaign for redo frontier", "delay", d)
+					heartbeatTimer = time.After(d)
+					continue
+				}
+			}
+
 			lastLeaderAddr, lastLeaderID := r.LeaderWithID()
 			r.setLeader("", "")
 
@@ -294,6 +328,7 @@ func (r *Raft) runFollower() {
 	}
 }
 
+// liveBootstrap 为集群播种初始配置(在线版 BootstrapCluster), 只能在主线程且仅当处于 follower 状态时调用。
 // liveBootstrap attempts to seed an initial configuration for the cluster. See
 // the Raft object's member BootstrapCluster for more details. This must only be
 // called on the main thread, and only makes sense in the follower state.
@@ -320,7 +355,20 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 	return r.processConfigurationLogEntry(&entry)
 }
 
+// runCandidate 跑 candidate 状态的主循环: 先征集 pre-vote(除非被禁用或本次是领导权转移), 拿到法定票数后当选, 否则等选举超时重来。
 // runCandidate runs the main loop while in the candidate state.
+//
+// 算法解读：
+//
+//	原理：默认先走预选举 —— 以 currentTerm+1 征集 pre-vote, 攒够法定票数才真正进入正式选举(electSelf, 会
+//	递增任期); 若被禁用预选举、或本次由领导权转移触发(candidateFromLeadershipTransfer), 则直接正式选举。
+//	关键不变量：收到更高任期的 pre-vote/vote 一律回退为 follower 并接受该任期; 转移触发的竞选跳过预选举是
+//	刻意的(否则转移会被预选举的「已有 leader」判据挡回); candidateFromLeadershipTransfer 每次退出 runCandidate
+//	都用 defer 复位, 否则该特权会被滥用(带此标志的 RequestVote 会让已有所属的节点也投票)。
+//	代价与边界：预选举多一轮往返, 但能在被隔离的节点上避免任期无意义地膨胀, 也就避免了它回来时打断健康
+//	leader。
+//	设计权衡：预选举把「试探」与「真投票」分开, 代价是选举慢一轮; 换来的是隔离节点不会靠自增任期反复扰乱
+//	集群。
 func (r *Raft) runCandidate() {
 	term := r.getCurrentTerm() + 1
 	r.logger.Info("entering candidate state", "node", r, "term", term)
@@ -487,6 +535,7 @@ func (r *Raft) runCandidate() {
 	}
 }
 
+// setLeadershipTransferInProgress 以原子方式设置「领导权转移进行中」标志, 供任意 goroutine 读取。
 func (r *Raft) setLeadershipTransferInProgress(v bool) {
 	if v {
 		atomic.StoreInt32(&r.leaderState.leadershipTransferInProgress, 1)
@@ -495,11 +544,13 @@ func (r *Raft) setLeadershipTransferInProgress(v bool) {
 	}
 }
 
+// getLeadershipTransferInProgress 原子读取「领导权转移进行中」标志。
 func (r *Raft) getLeadershipTransferInProgress() bool {
 	v := atomic.LoadInt32(&r.leaderState.leadershipTransferInProgress)
 	return v == 1
 }
 
+// setupLeaderState 初始化本次任期专属的 leader 状态(commitCh / commitment / inflight / replState / notify / stepDown), 并在开启 AsyncLeaderPersist 时拉起每任期的异步持久化写者。
 func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
 	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
@@ -525,8 +576,21 @@ func (r *Raft) setupLeaderState() {
 	}
 }
 
+// runLeader 进入 leader 状态的主入口: 完成领导权通知、leader 状态初始化、租约清零、后台指标协程与下台清理 defer, 然后落入 leaderLoop 热循环。
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
 // the leaderLoop for the hot loop.
+//
+// 算法解读：
+//
+//	原理：新 leader 必须先提交一条本任期的条目(noop)才能建立任期提交点。这里不单独派发 noop, 而是把它挂
+//	到 leaderState.pendingNoop, 等 leaderLoop 收到第一条真实日志时并到该批最前面一起派发; 同时起一个
+//	ElectionTimeout/2 的兜底定时器, 超时仍无真实日志就单独派发 noop。
+//	关键不变量：noop 必须在本任期被提交 —— 兜底定时器保证空闲集群不会永远等不到; pendingNoop 只由主线程
+//	读写, 下台时被置 nil(它从未拿到索引, 丢弃无副作用)。
+//	代价与边界：合并省下一次复制往返(第一条真实写入少一轮 RPC); 代价是空闲集群的任期提交点最多被推迟
+//	ElectionTimeout/2。
+//	设计权衡：为什么取选举超时的一半? noop 只是为了让本任期能提交, 对空闲集群没有延迟压力; 半程既远小于
+//	一次选举超时(不会诱发新选举), 又给真实写入留出足够的「搭车」窗口。合并只对任期内的第一批生效。
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
@@ -670,10 +734,23 @@ func (r *Raft) runLeader() {
 	r.leaderLoop()
 }
 
+// startStopReplication 按最新配置增删复制管线: 为新 peer 建 followerReplication 并起复制协程, 为被移除的 peer 复制到 lastIdx 后停掉; 只能在主线程调用。
 // startStopReplication will set up state and start asynchronous replication to
 // new peers, and stop replication to removed peers. Before removing a peer,
 // it'll instruct the replication routines to try to replicate to the current
 // index. This must only be called from the main thread.
+//
+// 算法解读：
+//
+//	原理：以最新配置为准做差集 —— 配置里有而 replState 里没有的 peer 新建 followerReplication 并起复制
+//	协程(初始 nextIndex = lastIdx+1, 假定对方已跟上); replState 里有而配置里没有的 peer, 先让复制协程把
+//	日志推到 lastIdx 再关闭 stopCh, 然后从 map 删除。
+//	关键不变量：被移除的 peer 必须先「追到 lastIdx」再停 —— 直接停会让它缺一段日志, 若它随后又出现在配置
+//	里就得走快照; 新增 peer 的 nextIndex 从 lastIdx+1 起步, 靠 AppendEntries 的冲突回退逐步校准到真实位置。
+//	代价与边界：本函数在主线程同步执行, 每处理一次配置变更就全量扫一遍 latest 配置与 replState(成员数 n 时
+//	O(n)), 成员规模大时开销可观。
+//	设计权衡：不做增量 diff 维护而是每次全量比对 —— 配置变更本就低频, 换来「replState 与 latest 配置最终
+//	一致」这一简单不变量。
 func (r *Raft) startStopReplication() {
 	inConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))
 	lastIdx := r.getLastIndex()
@@ -739,6 +816,7 @@ func (r *Raft) startStopReplication() {
 	metrics.SetGauge([]string{"raft", "peers"}, float32(len(r.configurations.latest.Servers)))
 }
 
+// configurationChangeChIfStable 仅在配置变更可安全处理时返回 configurationChangeCh, 否则返回 nil(在 select 中该分支永不就绪)。
 // configurationChangeChIfStable returns r.configurationChangeCh if it's safe
 // to process requests from it, or nil otherwise. This must only be called
 // from the main thread.
@@ -757,8 +835,25 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 	return nil
 }
 
+// leaderLoop 是 leader 的热循环: 处理 RPC、推进提交、组提交攒批、租约检查与领导权转移。
 // leaderLoop is the hot loop for a leader. It is invoked
 // after all the various leader setup is done.
+//
+// 算法解读：
+//
+//	原理：收到第一条 apply 后, 若配置了 BatchWindow(w>0), leader 把它当作批次起点, 在窗口内继续从 applyCh
+//	收集后续 append, 直到攒满 MaxAppendEntries 或窗口到期; 整批共享一次 StoreLogs 与一次复制往返。开启
+//	BatchWindowAdaptive 时先只等 grace=max(w/10, 500µs) 看有没有第二条: 有则照常等满窗口, 没有(批仍只有 1
+//	条)则跳过剩余窗口立即派发。
+//	关键不变量：批次内所有条目按 applyCh 到达顺序拿到连续索引; 窗口只决定「何时派发」, 不改「派发顺序」
+//	—— 攒批期间 leader 一直占着主线程, 不会有第二个攒批循环并发; pendingNoop 至多被合并一次(合并时置 nil
+//	并停掉 flush 定时器)。
+//	代价与边界：窗口越大吞吐越高(每批摊销的 fsync/往返越少), 但单条命令的追加延迟上界也越大(最坏 = 窗口
+//	长度)。低载时若无免窗, 每条命令都要白等满窗口(固定延迟税 = w), 免窗把它压到 grace。窗口仅在 w>0 时
+//	启用, 否则走上游的非阻塞 GROUP_COMMIT_LOOP(只捞已就绪条目, 不等待)。
+//	设计权衡：用「时间窗」而非「固定批大小」, 是因为低并发下批永远填不满, 等大小会无限等待; 用自适应
+//	grace 而非直接取消窗口, 是因为一旦第二条在 grace 内到达就说明有并发, 等满窗口仍划算 —— 免的只是
+//	「独苗」那一种情形的税。
 func (r *Raft) leaderLoop() {
 	// stepDown is used to track if there is an inflight log that
 	// would cause us to lose leadership (specifically a RemovePeer of
@@ -769,7 +864,7 @@ func (r *Raft) leaderLoop() {
 	stepDown := false
 	// This is only used for the first lease check, we reload lease below
 	// based on the current config value.
-	lease := time.After(r.config().LeaderLeaseTimeout)
+	lease := time.After(r.config().LeaderLeaseTimeout) // 首次租约检查用当前配置的完整窗口, 之后按 checkLeaderLease 返回的 maxDiff 动态校准
 
 	// vraft (12.4): the leadership noop is merged into the first real batch to
 	// save one replication round. If no client log arrives within half the
@@ -779,7 +874,7 @@ func (r *Raft) leaderLoop() {
 	flushNoopCh := make(chan struct{}, 1)
 	var flushNoopTimer *time.Timer
 	if r.leaderState.pendingNoop != nil {
-		flushTimeout := r.config().ElectionTimeout / 2
+		flushTimeout := r.config().ElectionTimeout / 2 // 取选举超时的一半: 远小于一次选举超时(不会诱发新选举), 又给真实写入留出搭车窗口
 		flushNoopTimer = time.AfterFunc(flushTimeout, func() {
 			select {
 			case flushNoopCh <- struct{}{}:
@@ -831,7 +926,7 @@ func (r *Raft) leaderLoop() {
 				cf.respond(fmt.Errorf("raft: no replication state for server %s", cf.serverID))
 				continue
 			}
-			cf.caughtUp = atomic.LoadUint64(&repl.matched) >= r.getLastIndex()
+			cf.caughtUp = atomic.LoadUint64(&repl.matched) >= r.getLastIndex() // 判据: 该 server 已确认匹配的索引追上了 leader 当前的 lastIndex
 			cf.respond(nil)
 
 		case future := <-r.leadershipTransferCh:
@@ -1077,9 +1172,9 @@ func (r *Raft) leaderLoop() {
 				if r.config().BatchWindowAdaptive {
 					// 低载免窗: 先给短 grace 等第二条, 无来活且批仍 1 条 → 跳过窗口
 					// 立即派发(消除低并发固定窗口税); grace 内来活则照常等满窗口。
-					grace := w / 10
+					grace := w / 10 // 免窗 grace = 窗口的十分之一
 					if grace < 500*time.Microsecond {
-						grace = 500 * time.Microsecond
+						grace = 500 * time.Microsecond // 下限 500µs: 窗口很小时 w/10 会被舍成 0, 那就退化成不免窗了
 					}
 					gt := time.NewTimer(grace)
 					select {
@@ -1149,7 +1244,7 @@ func (r *Raft) leaderLoop() {
 			}
 
 			// Renew the lease timer
-			lease = time.After(checkInterval)
+			lease = time.After(checkInterval) // 下次检查间隔按最慢的法定成员校准, 但不低于 minCheckInterval
 
 		case <-r.leaderNotifyCh:
 			for _, repl := range r.leaderState.replState {
@@ -1165,6 +1260,7 @@ func (r *Raft) leaderLoop() {
 	}
 }
 
+// verifyLeader 发起一次 leader 校验: 自投一票并触发所有 follower 立即心跳, 由主线程调用。
 // verifyLeader must be called from the main thread for safety.
 // Causes the followers to attempt an immediate heartbeat.
 func (r *Raft) verifyLeader(v *verifyFuture) {
@@ -1191,7 +1287,20 @@ func (r *Raft) verifyLeader(v *verifyFuture) {
 	}
 }
 
+// leadershipTransfer 是领导权转移的主体: 先等目标 follower 追平到 leader 的 lastIndex, 再向它发 TimeoutNow 令其立刻竞选。
 // leadershipTransfer is doing the heavy lifting for the leadership transfer.
+//
+// 算法解读：
+//
+//	原理：转移分两步 —— 先循环等待目标 follower 的 nextIndex 超过 leader 的 lastIndex(即已追平), 每轮通过
+//	triggerDeferErrorCh 催一次复制并等它的结果; 追平后再发一条 TimeoutNow, 让目标立刻超时竞选。
+//	关键不变量：必须「先追平再让位」—— 否则目标落后于 leader, 当选后要么丢数据要么被迫追日志; 整个过程受
+//	stopCh 控制, 一旦离开 leaderLoop(丢了领导权)就中止, 此时返回 nil 表示「以预期方式结束」。
+//	代价与边界：等待追平没有内置超时, 超时由 leaderLoop 外的看门 goroutine(ElectionTimeout)负责, 超时后关
+//	掉 stopCh 并回错误; TimeoutNow 是阻塞调用且无法中止, 所以它被放在 goroutine 里跑, 保证 leaderLoop 不被
+//	卡住。
+//	设计权衡：把「追平」与「发 TimeoutNow」分成两步而非直接让位, 是为了让转移在有未复制日志时也安全; 代价
+//	是转移耗时取决于落后 follower 的追平速度。
 func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {
 	// make sure we are not already stopped
 	select {
@@ -1234,10 +1343,22 @@ func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *foll
 	doneCh <- err
 }
 
+// checkLeaderLease 检查最近一个租约窗口内能否联系到法定人数, 联系不上就下台为 follower; 返回最长的「无联系」时长, 只能在主线程调用。
 // checkLeaderLease is used to check if we can contact a quorum of nodes
 // within the last leader lease interval. If not, we need to step down,
 // as we may have lost connectivity. Returns the maximum duration without
 // contact. This must only be called from the main thread.
+//
+// 算法解读：
+//
+//	原理：遍历最新配置里的 voter, 统计在 LeaderLeaseTimeout 内有过联系的个数(自己永远算一个); 够法定人数就
+//	把租约截止时间发布为 now - maxDiff + LeaderLeaseTimeout, 不够就下台为 follower。
+//	关键不变量：租约只能由「刚确认过的法定联系」赢得, 不能从上一任期继承(runLeader 里把截止时间清零);
+//	下台时同样清零, 否则失去领导权的节点还能继续按租约读。
+//	代价与边界：maxDiff 是「最慢的那个法定成员有多久没联系」, 用它做截止时间等于按最坏情况打折, 保守但
+//	安全; 下一次检查间隔 = LeaderLeaseTimeout - maxDiff, 且不低于 minCheckInterval(10ms), 避免空转。
+//	设计权衡：租约让 leader 可本地服务线性一致读而不必每读一轮往返; 代价是读的时效上界依赖时钟, 只在不要求
+//	严格线性一致的档位下才可放开。
 func (r *Raft) checkLeaderLease() time.Duration {
 	// Track contacted nodes, we can always contact ourself
 	contacted := 0
@@ -1292,6 +1413,7 @@ func (r *Raft) checkLeaderLease() time.Duration {
 	return maxDiff
 }
 
+// leaderLeaseValid 报告本节点当前是否持有有效领导权租约(仍是 leader, 且主线程在 LeaderLeaseTimeout 内确认过法定联系); 可从任意 goroutine 调用, 只读原子截止时间, 绝不主动下台。
 // leaderLeaseValid reports whether this node currently holds a valid leadership
 // lease: it is the leader AND the main thread has confirmed contact with a
 // quorum of voters within LeaderLeaseTimeout. Unlike checkLeaderLease it never
@@ -1300,6 +1422,17 @@ func (r *Raft) checkLeaderLease() time.Duration {
 // derives the quorum size from the snapshot of the latest configuration rather
 // than the main-thread copy. A zero deadline (leader not yet contacted a quorum,
 // or not the leader) reports invalid.
+//
+// 算法解读：
+//
+//	原理：读侧只做两件事 —— 确认自己仍是 leader, 再读 checkLeaderLease 发布的原子截止时间, 未过期即有效;
+//	完全不碰主线程状态, 因此可从任意 goroutine 调用。
+//	关键不变量：截止时间为 0 表示「尚未确认过法定联系」(或已下台), 一律判无效 —— 把 0 当作「永不过期」会让
+//	刚当选的 leader 在还没联系上任何人时就服务读。
+//	代价与边界：这是租约读而非严格线性一致读: 时钟漂移或长 GC 停顿可能让读在真实 leader 已换届后仍短暂
+//	成立。
+//	设计权衡：把判定拆成「主线程发布 + 任意线程只读原子值」, 避免读路径去抢主线程的锁; 代价是读的判定与
+//	主线程状态之间多一层间接。
 func (r *Raft) leaderLeaseValid() bool {
 	if r.State() != Leader {
 		return false
@@ -1308,6 +1441,7 @@ func (r *Raft) leaderLeaseValid() bool {
 	return deadline != 0 && time.Now().UnixNano() < deadline
 }
 
+// quorumSize 返回当前最新配置下法定人数的大小(投票成员数过半加一), 只能在主线程调用。
 // quorumSize is used to return the quorum size. This must only be called on
 // the main thread.
 // TODO: revisit usage
@@ -1321,6 +1455,7 @@ func (r *Raft) quorumSize() int {
 	return voters/2 + 1
 }
 
+// restoreUserSnapshot 手动消费一份外部快照(如从备份恢复): 用当前配置而非快照内配置, 并刻意在 lastIndex 上烧出一个空洞, 迫使后续复制走快照路径; 只能在 leader 上运行。
 // restoreUserSnapshot is used to manually consume an external snapshot, such
 // as if restoring from a backup. We will use the current Raft configuration,
 // not the one from the snapshot, so that we can restore into a new cluster. We
@@ -1329,6 +1464,18 @@ func (r *Raft) quorumSize() int {
 // so that the snapshot will be sent to followers and used for any new joiners.
 // This can only be run on the leader, and returns a future that can be used to
 // block until complete.
+//
+// 算法解读：
+//
+//	原理：用当前(而非快照内)的配置创建一份新快照, 索引取 max(快照 index, 当前 lastIndex)+1 —— 即在日志里
+//	刻意烧出一个空洞; 随后把该状态写进 lastLog/lastApplied/lastSnapshot, 并清掉旧日志。
+//	关键不变量：索引必须严格大于已有 lastIndex 且无对应日志条目 —— follower 复制到该索引时因查不到日志而
+//	触发 InstallSnapshot, 新节点也能直接靠快照加入; 配置必须已提交(committedIndex == latestIndex)才允许恢复,
+//	因为快照格式无法表达「未提交的配置变更」。
+//	代价与边界：恢复会先中止所有 inflight 请求(回 ErrAbortedByRestore); FSM 恢复失败直接 panic —— 此时进程
+//	状态已不可信。
+//	设计权衡：宁可烧一个索引空洞也不用连续索引, 是为了让「快照 + 日志」两套来源不产生歧义; 代价是日志里
+//	永远留一个洞, 必须靠 MonotonicLogStore 的 removeOldLogs 而非 compact 来清理。
 func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 	defer metrics.MeasureSince([]string{"raft", "restoreUserSnapshot"}, time.Now())
 
@@ -1425,6 +1572,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 	return nil
 }
 
+// appendConfigurationEntry 把一次成员变更落成配置日志条目并派发, 同时更新 latest 配置、commitment 与复制管线; 只能在主线程调用。
 // appendConfigurationEntry changes the configuration and adds a new
 // configuration entry to the log. This must only be called from the
 // main thread.
@@ -1467,8 +1615,24 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	r.startStopReplication()
 }
 
+// dispatchLogs 由 leader 调用: 给一批 logFuture 分配递增索引、置为 inflight, 落盘(或交给异步写者)后通知复制管线开始复制。
 // dispatchLog is called on the leader to push a log to disk, mark it
 // as inflight and begin replication of it.
+//
+// 算法解读：
+//
+//	原理：给批次里每条 logFuture 依次分配 lastIndex+1、+2 …, 置 Term/AppendedAt, 压入 inflight 队列; 然后
+//	同步模式直接 StoreLogs + fsync 后 commitment.match(self), 异步模式把批次塞进 pending 缓冲并投给
+//	asyncWriteCh, 立即通知复制管线, 让 follower 复制与 leader 自身 fsync 重叠。
+//	关键不变量：索引分配必须越过 pending 尾巴 —— 异步模式下已派发未落盘的条目还在 pending 缓冲里, 若只按
+//	持久化 lastLog 分配, 两个在写者追上之前先后派发的批次会拿到相同索引, 后一批静默覆盖前一批; commitIndex
+//	只能由 leader 自身已持久化的日志推进(persistAsyncBatch 里的 commitment.match), 绝不能被内存 pending 推进。
+//	代价与边界：异步模式让 follower 能拉取 leader 尚未 fsync 的条目(靠 pending 缓冲的 getLog 供给), 因此
+//	leader 崩溃可能丢掉「已复制给 follower 但自己没落盘」的条目 —— 仍满足 Raft 安全性(未持久化的不会被
+//	提交), 但表现为回滚。
+//	设计权衡：把 fsync 移出主线程, 让 leader 写盘与网络复制并行, 单批延迟从 fsync+往返降为
+//	max(fsync, 往返); 代价是引入 pending 这一层「未持久化但可见」的状态, 必须靠「索引越过尾巴」与「commit
+//	封顶」两条规则兜住。
 func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	now := time.Now()
 	defer metrics.MeasureSince([]string{"raft", "leader", "dispatchLog"}, now)
@@ -1491,6 +1655,20 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 			}
 		}
 		r.pendingMu.Unlock()
+
+		// ★游标窗口兜底(2026-10-24): 异步写者的推进顺序是 StoreLogs → setLastLog
+		// → dropPendingThrough。在 StoreLogs 已返回、setLastLog 未执行之间, store
+		// 的 last 已经是 N 而内存 lastLog 仍是 N-1; 此时若 pending 也不再覆盖 N
+		// (下台清理 clearPending 会清掉在途批的尾巴; 或者 getLastIndex 与上面
+		// pendingMu 两次取锁之间写者恰好完成 setLastLog + dropPendingThrough),
+		// 只按 lastLog/pending 分配索引就会把已落盘的 N 再派发一次 —— StoreLogs
+		// 收到 batch first == store last 的重叠批(现场 leader 异步持久化
+		// "store last=15007, batch first=15007" 即此)。这里以 store 的真实
+		// LastIndex() 兜底, 保证新批永远从真实最后一条之后开始。
+		// 只取更大值: store 落后于 lastLog(快照装回/尚未落盘)时保持原游标。
+		if storeLast, err := r.logs.LastIndex(); err == nil && storeLast > lastIndex {
+			lastIndex = storeLast
+		}
 	}
 
 	n := len(applyLogs)
@@ -1518,7 +1696,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		// batches in order; the futures stay on the inflight list and are
 		// responded once they are committed (which can only happen after the
 		// batch is durable on the leader).
-		r.appendPending(logs, lastIndex-uint64(n)+1)
+		r.appendPending(logs, lastIndex-uint64(n)+1) // 批次起始索引 = 末索引 - 条数 + 1
 		for _, f := range r.leaderState.replState {
 			asyncNotifyCh(f.triggerCh)
 		}
@@ -1561,6 +1739,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	}
 }
 
+// appendPending 把一批已派发日志记入异步持久化的 pending 缓冲; 必须在主线程按索引升序调用。
 // appendPending records a dispatched batch in the async-persist pending buffer.
 // Must be called from the main thread (dispatchLogs), in index order.
 func (r *Raft) appendPending(logs []*Log, base uint64) {
@@ -1572,8 +1751,19 @@ func (r *Raft) appendPending(logs []*Log, base uint64) {
 	r.pendingLogs = append(r.pendingLogs, logs...)
 }
 
+// dropPendingThrough 在异步写者持久化完成后, 从 pending 缓冲中丢弃 <= index 的前缀。
 // dropPendingThrough removes entries up to and including index from the
 // pending buffer once they have been persisted by the async writer.
+//
+// 算法解读：
+//
+//	原理：pending 缓冲是一段连续索引 [pendingBase, pendingBase+len-1]。写者持久化到 index 后丢掉这段前缀:
+//	若 index 已覆盖到顶端则整体清空, 否则把剩余条目 copy 到切片头部并前移 pendingBase。
+//	关键不变量：pendingBase 与 len(pendingLogs) 必须始终满足 top = pendingBase+len-1, 任何一步错位都会让
+//	getLog 与 getReplicationLastIndex 读到错误的索引; index 落在缓冲之前(已丢过)时直接返回。
+//	代价与边界：用 copy 前移而非环形缓冲, 每次丢弃都要搬移剩余元素 —— 缓冲长度受在途批次数限制, 实际很小。
+//	设计权衡：选简单切片 + copy 而非 ring buffer, 是为了让 getLog 的随机索引查找保持 O(1) 且代码可读; 代价
+//	是丢弃时的一次 O(剩余长度) 搬移。
 func (r *Raft) dropPendingThrough(index uint64) {
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
@@ -1595,6 +1785,7 @@ func (r *Raft) dropPendingThrough(index uint64) {
 	r.pendingBase += uint64(drop)
 }
 
+// clearPending 清空整个 pending 缓冲; 领导权丢失时调用, 避免未来 leader 复用同一段索引时读到陈旧条目。
 // clearPending drops the whole pending buffer. Called on leadership loss so a
 // future leader never serves stale entries for indexes it re-issues.
 func (r *Raft) clearPending() {
@@ -1604,12 +1795,13 @@ func (r *Raft) clearPending() {
 	r.pendingMu.Unlock()
 }
 
+// getLog 读取一条日志: 优先命中异步持久化的 pending 缓冲(已派发但尚未落盘), 未命中再回落到持久化 LogStore。
 // getLog reads a log entry, preferring the async-persist pending buffer (for
 // entries dispatched but not yet durable) and falling back to the durable log
 // store.
 func (r *Raft) getLog(index uint64, log *Log) error {
 	r.pendingMu.Lock()
-	if r.pendingBase > 0 && index >= r.pendingBase {
+	if r.pendingBase > 0 && index >= r.pendingBase { // pendingBase == 0 表示缓冲空(合法日志索引从 1 起, 0 不可能是索引)
 		if off := int(index - r.pendingBase); off < len(r.pendingLogs) {
 			*log = *r.pendingLogs[off]
 			r.pendingMu.Unlock()
@@ -1620,10 +1812,22 @@ func (r *Raft) getLog(index uint64, log *Log) error {
 	return r.logs.GetLog(index, log)
 }
 
+// getReplicationLastIndex 返回 leader 当前可复制给 follower 的最高索引: 持久化的 lastLog 再加上 pending 尾巴(已派发未 fsync 的条目)。
 // getReplicationLastIndex returns the highest index the leader may currently
 // replicate to followers: the durable last log plus the async-persist pending
 // tail (entries already dispatched but not yet fsynced). Without async persist
 // the pending buffer is always empty, so this returns the durable index.
+//
+// 算法解读：
+//
+//	原理：复制水位取「持久化 lastLog」与「pending 缓冲顶端」的较大者。异步模式下 pending 里的条目虽未
+//	fsync, 但内容已在 leader 内存且完整, 可以安全地复制给 follower(follower 落盘后它就持久了)。
+//	关键不变量：水位只可能 >= 持久化 lastLog, 不会倒退; 未开异步持久化时 pending 恒空, 退化为返回持久化
+//	lastLog, 与上游行为一致。
+//	代价与边界：leader 把 pending 条目复制出去之后崩溃, 自己会丢掉这些条目而 follower 保留 —— 这不违反
+//	安全性(它们尚未提交), 但会在新 leader 上任后被覆盖。
+//	设计权衡：让 follower 能拉取未持久化条目, 是为了不让 leader 的 fsync 成为复制吞吐的瓶颈; 安全性由
+//	「commitIndex 被 leader 自身持久化进度封顶」兜底。
 func (r *Raft) getReplicationLastIndex() uint64 {
 	lastLogIdx, _ := r.getLastLog()
 	if !r.config().AsyncLeaderPersist {
@@ -1649,10 +1853,22 @@ func (r *Raft) getReplicationLastIndex() uint64 {
 // sync persist gets for free from blocking on the fsync.
 const asyncCoalesceMax = 64
 
+// runAsyncWriter 是每任期的异步持久化协程: 按派发顺序串行地把 leader 批次写盘, 使 store 与 raft lastLog 单调推进, 同时 follower 复制并行进行。
 // runAsyncWriter is the per-leadership goroutine that persists dispatched
 // leader batches serially, in dispatch order, so the store and the raft
 // last-log index advance monotonically even while the batches are replicated
 // to followers in parallel.
+//
+// 算法解读：
+//
+//	原理：写者从 asyncWriteCh 取一个批次后, 立刻以非阻塞方式再吸最多 asyncCoalesceMax(64) 个已排队批次,
+//	合并成一次 StoreLogs 调用 —— 同步模式靠阻塞在 fsync 上自然攒批, 异步模式没有这个阻塞, 必须显式合并。
+//	关键不变量：asyncWriteCh 是 FIFO 且属于同一任期, 合并保持派发顺序与 term; 合并只取「立即可得」的批次,
+//	绝不等待, 因此写者总能回到 select 观察 stopCh/shutdownCh。
+//	代价与边界：上限 64 使持续生产者不能把单次 StoreLogs 撑到无界(内存与单次 fsync 时长都有上界), 并与
+//	MaxAppendEntries 对齐, 使异步模式的批大小与同步模式相当。
+//	设计权衡：不设上限会在高负载下把写者变成「永远在攒批、从不落盘」; 设成 1 则退回每条一次 fsync。64 是
+//	「恢复同步模式攒批效果」与「保持响应关机」之间的折中。
 func (r *Raft) runAsyncWriter(stopCh chan struct{}) {
 	for {
 		select {
@@ -1695,8 +1911,20 @@ func (r *Raft) runAsyncWriter(stopCh chan struct{}) {
 	}
 }
 
+// persistAsyncBatch 持久化一个 leader 批次, 并在批次落盘后推进 commitment。
 // persistAsyncBatch persists one leader batch and advances commitment once the
 // batch is durable. See the asyncWrite comment for the safety rules.
+//
+// 算法解读：
+//
+//	原理：异步写者串行地把批次 StoreLogs 落盘, 成功后 setLastLog 并调用 commitment.match(self, lastIndex)
+//	—— 即用「leader 自己已持久化的最高索引」给 commitIndex 封顶。
+//	关键不变量：只有仍处于同一任期、且 commitment 仍是当前那个时, 才计入提交; 写失败时把 asyncWriteFailed
+//	置真、唤醒主线程下台, 并丢弃 pending 到该索引, 此后不再接受新提交 —— 因为已无法保证日志的持久性。
+//	代价与边界：commit 因此被「leader 自身 fsync 进度」限速, 即使多数 follower 早已确认; 这是刻意的: 提交
+//	一条 leader 自己都可能丢的日志会破坏 Raft 安全性。
+//	设计权衡：不用「多数派确认即提交」的乐观做法, 是因为异步持久化下多数派确认的是 leader 内存里的条目,
+//	leader 崩溃即丢 —— 必须先自持久化再认提交。
 func (r *Raft) persistAsyncBatch(w asyncWrite) {
 	if r.asyncWriteFailed.Load() {
 		for _, f := range w.futures {
@@ -1740,12 +1968,25 @@ func (r *Raft) persistAsyncBatch(w asyncWrite) {
 	}
 }
 
+// processLogs 把 lastApplied 之后、到 index 为止的日志按 MaxAppendEntries 分批喂给 FSM, 并把 lastApplied 推进到 index; leader 与 follower 都会调用(follower 传 futures=nil)。
 // applied up to the given index limit.
 // This can be called from both leaders and followers.
 // Followers call this from AppendEntries, for n entries at a time, and always
 // pass futures=nil.
 // Leaders call this when entries are committed. They pass the futures from any
 // inflight logs.
+//
+// 算法解读：
+//
+//	原理：从 lastApplied+1 逐条走到 index; leader 侧优先用 futures 里的内存条目(避免回读日志文件), follower
+//	侧从 LogStore 读。需要应用的条目攒够 MaxAppendEntries 就投一次 fsmMutateCh, 最后把 lastApplied 推进到
+//	index。
+//	关键不变量：lastApplied 只增不减, 且必须在所有批次投递之后才推进 —— 提前推进会让崩溃后的重放漏掉尚未
+//	真正应用的条目; 已应用过的 index(<= lastApplied)直接拒绝。
+//	代价与边界：单次调用的最大批次内存 = MaxAppendEntries 个 commitTuple; 若 FSM 投递通道阻塞在关机, 未投
+//	递的 future 会被回以 ErrRaftShutdown。
+//	设计权衡：批量投递而非逐条投递, 摊薄 FSM 的通道/唤醒开销; 但批内不做「读到一半失败」的补偿 —— 读日志
+//	失败直接 panic, 因为此时状态已不可信。
 func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	// Reject logs we've applied already
 	lastApplied := r.getLastApplied()
@@ -1815,6 +2056,7 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	r.setLastApplied(index)
 }
 
+// prepareLog 决定一条已提交日志是否需要送进 FSM: 命令/屏障/新版配置条目需要, noop 与旧版 peer 变更条目忽略。
 // processLog is invoked to process the application of a single committed log entry.
 func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
 	switch l.Type {
@@ -1842,6 +2084,7 @@ func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
 	return nil
 }
 
+// tryStageCommitIndex 在启用 RestoreCommittedLogs 且 LogStore 实现 CommitTrackingLogStore 时, 把提交索引落进存储; 否则静默返回。
 // tryStageCommitIndex updates the commit index in persist store if restore committed logs is enabled and log store implements CommitTrackingLogStore.
 func (r *Raft) tryStageCommitIndex(commitIndex uint64) {
 	if !r.RestoreCommittedLogs {
@@ -1856,6 +2099,7 @@ func (r *Raft) tryStageCommitIndex(commitIndex uint64) {
 	}
 }
 
+// processRPC 按命令类型把入站 RPC 分派给对应处理函数, 未知命令回 "unexpected command" 错误; 只能在主线程调用。
 // processRPC is called to handle an incoming RPC request. This must only be
 // called from the main thread.
 func (r *Raft) processRPC(rpc RPC) {
@@ -1883,6 +2127,7 @@ func (r *Raft) processRPC(rpc RPC) {
 	}
 }
 
+// processHeartbeat 是心跳专用的快路径入口, 只接受 AppendEntriesRequest, 供支持该优化的传输层使用; 只能在主线程调用。
 // processHeartbeat is a special handler used just for heartbeat requests
 // so that they can be fast-pathed if a transport supports it. This must only
 // be called from the main thread.
@@ -1906,8 +2151,23 @@ func (r *Raft) processHeartbeat(rpc RPC) {
 	}
 }
 
+// appendEntries 处理 leader 的 AppendEntries RPC: 任期/前缀校验、冲突截断、追加新条目、推进 commitIndex 并把已提交日志喂给 FSM; 只能在主线程调用。
 // appendEntries is invoked when we get an append entries RPC call. This must
 // only be called from the main thread.
+//
+// 算法解读：
+//
+//	原理：先按任期/前缀(PrevLogEntry + PrevLogTerm)校验, 再定位新条目起点: 逐条比对已有条目的 term, 相同则
+//	跳过(去重), 遇到 term 不同的位置就 DeleteRange 截断后缀并从这里整段接收。新条目先做 P4 指针解析
+//	(resolveElidedEntries), 再 StoreLogs, 最后把 commitIndex 推进到 min(LeaderCommitIndex, 本地 lastIndex),
+//	并把由此新提交的条目喂给 FSM。
+//	关键不变量：commitIndex 永不超过本地已有日志的 lastIndex(min 保证); 截断后缀后必须同步回退 latest 配置
+//	(否则会持有来自被截断条目的配置); 指针解析失败要以 DataMissingFrom 显式回退, 绝不能把 Data 缺失的条目
+//	静默落盘。
+//	代价与边界：冲突检测逐条回读日志文件, 冲突窗口越大越慢; 前缀不匹配时置 NoRetryBackoff, 让 leader 立刻
+//	回退 nextIndex 而不必等退避。
+//	设计权衡：先解析指针再落盘(而非先落盘后补 Data), 保证「落盘的条目永远完整」; 代价是解析失败时整批退回,
+//	让 leader 对这个 follower 走全量复制。
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "appendEntries"}, time.Now())
 	// Setup a response
@@ -1944,7 +2204,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))
 	}
 	// Verify the last log entry
-	if a.PrevLogEntry > 0 {
+	if a.PrevLogEntry > 0 { // PrevLogEntry == 0 表示 leader 认为这是第一条日志, 无需前缀校验
 		lastIdx, lastTerm := r.getLastEntry()
 
 		var prevLogTerm uint64
@@ -1978,6 +2238,18 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 		// Delete any conflicting entries, skip any duplicates
 		lastLogIdx, _ := r.getLastLog()
+		// ★同 dispatchLogs 的游标窗口(2026-10-24): 节点刚下台时, 旧任期的异步
+		// 写者可能已经 StoreLogs 落盘、但 setLastLog 尚未执行, 且 pending 已被
+		// 下台清理清空。若只按内存 lastLog 判定哪些条目"已存在", 会把 store 里
+		// 已有的索引当成 newEntries 重写(first == store last)。以 store 的真实
+		// last 抬高已存在水位 —— 区间内的条目仍逐条 GetLog 比对 term, term 冲突
+		// 照常 DeleteRange 截断, 因此判定语义不变, 只是不再重写已落盘条目。
+		// 未开异步持久化时不存在并发写者, 保持原行为(不加这次读取)。
+		if r.config().AsyncLeaderPersist {
+			if storeLast, err := r.logs.LastIndex(); err == nil && storeLast > lastLogIdx {
+				lastLogIdx = storeLast
+			}
+		}
 		var newEntries []*Log
 		for i, entry := range a.Entries {
 			if entry.Index > lastLogIdx {
@@ -2008,7 +2280,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		if n := len(newEntries); n > 0 {
 			// Stage the future commit index if possible
 			lastNewIndex := newEntries[len(newEntries)-1].Index
-			commitIndex := min(a.LeaderCommitIndex, lastNewIndex)
+			commitIndex := min(a.LeaderCommitIndex, lastNewIndex) // 暂存提交索引只按本批新条目推进, 不超过本批最后一条
 			r.tryStageCommitIndex(commitIndex)
 
 			// 12.14 P4: resolve pointer-tier (elided) entries against the local
@@ -2059,7 +2331,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	// Update the commit index
 	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
 		start := time.Now()
-		idx := min(a.LeaderCommitIndex, r.getLastIndex())
+		idx := min(a.LeaderCommitIndex, r.getLastIndex()) // 夹住: 绝不提交本地还没有的日志
 		r.setCommitIndex(idx)
 		if r.configurations.latestIndex <= idx {
 			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
@@ -2073,6 +2345,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	r.setLastContact()
 }
 
+// processConfigurationLogEntry 依据一条配置类日志条目更新 latest 配置(先把原 latest 提升为 committed); 只能在主线程或 NewRaft 起线程前调用。
 // processConfigurationLogEntry takes a log entry and updates the latest
 // configuration if the entry results in a new configuration. This must only be
 // called from the main thread, or from NewRaft() before any threads have begun.
@@ -2093,7 +2366,19 @@ func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 	return nil
 }
 
+// requestVote 处理 RequestVote RPC: 依次做配置、已知 leader、任期、是否已投票、日志新旧等校验, 通过后持久化投票并授予。
 // requestVote is invoked when we get a request vote RPC call.
+//
+// 算法解读：
+//
+//	原理：按序校验 —— 候选人在配置内、没有已知 leader(除非是领导权转移)、任期不旧、自己没在本任期投过票、
+//	候选人日志不比自己旧(先比 lastTerm, 相同再比 lastIndex); 全过则持久化投票并授予。
+//	关键不变量：同一任期只投一票(靠持久化的 lastVoteTerm/lastVoteCand, 重启后依然生效), 且只投给日志至少
+//	一样新的候选人 —— 这两条是选举安全的核心, 破坏任一条都可能选出丢数据的 leader。
+//	代价与边界：每次投票都要读 StableStore 并落盘(同步 fsync), 是选举路径上最重的一步; 重复请求同任期同
+//	候选人会直接回授予(幂等), 避免网络重传导致候选人收不到票。
+//	设计权衡：宁可拒绝也不投「日志更旧」的候选人, 代价是网络分区恢复时旧 leader 更难连任; 这是 Raft 用
+//	可用性换一致性的取舍。
 func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
 	r.observe(*req)
@@ -2177,7 +2462,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		}
 	}
 	// Check if we have voted yet
-	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm) // 注意: 下面用错误字符串判「未找到」, 是非结构化 error 接口留下的脆弱判据
 	if err != nil && err.Error() != "not found" {
 		r.logger.Error("failed to get last vote term", "error", err)
 		return
@@ -2226,6 +2511,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	r.setLastContact()
 }
 
+// requestPreVote 处理 PreVote RPC: 不改变自身任期与状态, 只回答「若你发起竞选, 我是否愿投」, 用于抑制被隔离节点的任期膨胀。
 // requestPreVote is invoked when we get a request Pre-Vote RPC call.
 func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestPreVote"}, time.Now())
@@ -2301,6 +2587,7 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 	resp.Granted = true
 }
 
+// installSnapshot 处理 InstallSnapshot RPC: 把远端快照落盘、恢复进 FSM, 并重置 lastApplied / lastSnapshot 与配置; 只能在主线程调用。
 // installSnapshot is invoked when we get a InstallSnapshot RPC call.
 // We must be in the follower state for this, since it means we are
 // too far behind a leader for log replay. This must only be called
@@ -2446,6 +2733,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	r.setLastContact()
 }
 
+// setLastContact 把最近一次联系时间置为当前时刻。
 // setLastContact is used to set the last contact time to now
 func (r *Raft) setLastContact() {
 	r.lastContactLock.Lock()
@@ -2463,6 +2751,7 @@ type preVoteResult struct {
 	voterID ServerID
 }
 
+// electSelf 发起正式选举: 递增当前任期、给自己投票并持久化, 再向所有 voter 并发发送 RequestVote; 只能在主线程调用。
 // electSelf is used to send a RequestVote RPC to all peers, and vote for
 // ourself. This has the side affecting of incrementing the current term. The
 // response channel returned is used to wait for all the responses (including a
@@ -2536,6 +2825,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 	return respCh
 }
 
+// preElectSelf 发起预选举: 用 currentTerm+1 试探性征集 pre-vote, 但不改变自身任期与状态; 只能在主线程调用。
 // preElectSelf is used to send a RequestPreVote RPC to all peers, and vote for
 // ourself. This will not increment the current term. The
 // response channel returned is used to wait for all the responses (including a
@@ -2620,6 +2910,7 @@ func (r *Raft) preElectSelf() <-chan *preVoteResult {
 	return respCh
 }
 
+// persistVote 把本次投票(任期 + 候选人地址)持久化到 StableStore, 保证崩溃重启后不会重复投票。
 // persistVote is used to persist our vote for safety.
 func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
@@ -2631,15 +2922,17 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	return nil
 }
 
+// setCurrentTerm 先持久化再更新内存中的当前任期; 持久化失败直接 panic(任期丢失会破坏选举安全)。
 // setCurrentTerm is used to set the current term in a durable manner.
 func (r *Raft) setCurrentTerm(t uint64) {
 	// Persist to disk first
 	if err := r.stable.SetUint64(keyCurrentTerm, t); err != nil {
-		panic(fmt.Errorf("failed to save current term: %v", err))
+		panic(fmt.Errorf("failed to save current term: %v", err)) // 任期是选举安全的根: 存不下就必须立刻终止进程, 不能带着未知任期继续
 	}
 	r.raftState.setCurrentTerm(t)
 }
 
+// setState 更新当前状态; 任何状态切换都会先清空已知 leader, 因此 leader 必须在 setState 之后再设置。
 // setState is used to update the current state. Any state
 // transition causes the known leader to be cleared. This means
 // that leader should be set only after updating the state.
@@ -2652,6 +2945,7 @@ func (r *Raft) setState(state RaftState) {
 	}
 }
 
+// pickServer 在参与法定人数的 voter 中挑出复制进度(nextIndex)最靠前的那个作为领导权转移的默认目标; 只能在 leaderLoop 内调用。
 // pickServer returns the follower that is most up to date and participating in quorum.
 // Because it accesses leaderstate, it should only be called from the leaderloop.
 func (r *Raft) pickServer() *Server {
@@ -2675,6 +2969,7 @@ func (r *Raft) pickServer() *Server {
 	return pick
 }
 
+// initiateLeadershipTransfer 是领导权转移的入口: 把请求投给 leadershipTransferCh 交给主循环执行, 拒绝转移给自身。
 // initiateLeadershipTransfer starts the leadership on the leader side, by
 // sending a message to the leadershipTransferCh, to make sure it runs in the
 // mainloop.
@@ -2699,14 +2994,16 @@ func (r *Raft) initiateLeadershipTransfer(id *ServerID, address *ServerAddress) 
 	}
 }
 
+// timeoutNow 处理 TimeoutNowRequest: 清空 leader、转为 candidate 并打上「由领导权转移触发」标志, 立即开始竞选。
 // timeoutNow is what happens when a server receives a TimeoutNowRequest.
 func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	r.setLeader("", "")
 	r.setState(Candidate)
-	r.candidateFromLeadershipTransfer.Store(true)
+	r.candidateFromLeadershipTransfer.Store(true) // 注意: 本函数不校验 req.Term, 它信任 leader 发来的 TimeoutNow
 	rpc.Respond(&TimeoutNowResponse{}, nil)
 }
 
+// setLatestConfiguration 写入最新配置及其索引, 并刷新供主循环外读取的 latestConfiguration 副本。
 // setLatestConfiguration stores the latest configuration and updates a copy of it.
 func (r *Raft) setLatestConfiguration(c Configuration, i uint64) {
 	r.configurations.latest = c
@@ -2714,12 +3011,14 @@ func (r *Raft) setLatestConfiguration(c Configuration, i uint64) {
 	r.latestConfiguration.Store(c.Clone())
 }
 
+// setCommittedConfiguration 写入已提交配置及其索引。
 // setCommittedConfiguration stores the committed configuration.
 func (r *Raft) setCommittedConfiguration(c Configuration, i uint64) {
 	r.configurations.committed = c
 	r.configurations.committedIndex = i
 }
 
+// getLatestConfiguration 返回最新配置的副本(可从主循环外安全读取); 尚未设置过配置时返回空配置。
 // getLatestConfiguration reads the configuration from a copy of the main
 // configuration, which means it can be accessed independently from the main
 // loop.

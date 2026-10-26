@@ -3,6 +3,14 @@
 
 package raft
 
+// RPCHeader 是各类 RPC 消息共用的头部子结构: 协议版本 + 发送方 ServerID + 发送方
+// 地址。它按值内嵌进每个请求/响应结构体, 所以这些结构体都"自带一个头"; 而
+// WithRPCHeader 接口让传输层在不认识具体消息类型时也能把头取出来。
+//
+// 线上编码: 本文件的这些结构体由 go-msgpack 反射编码(见 net_transport.go 的
+// codec.Encoder/Decoder), 字段名与顺序即线上格式, 改动字段名等于改协议;
+// 而日志的 Data 与 12.14 P4 的指针走 raw 字节旁路, 不经过 msgpack。
+//
 // RPCHeader is a common sub-structure used to pass along protocol version and
 // other information about the cluster. For older Raft implementations before
 // versioning was added this will default to a zero-valued structure when read
@@ -17,6 +25,8 @@ type RPCHeader struct {
 	Addr []byte
 }
 
+// WithRPCHeader 暴露 RPC 头的接口: 本文件里每个请求/响应类型都实现了它。
+//
 // WithRPCHeader is an interface that exposes the RPC header.
 type WithRPCHeader interface {
 	GetRPCHeader() RPCHeader
@@ -44,11 +54,14 @@ type AppendEntriesRequest struct {
 	LeaderCommitIndex uint64
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *AppendEntriesRequest) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
 
+// AppendEntriesResponse 是 AppendEntriesRequest 的响应。
+//
 // AppendEntriesResponse is the response returned from an
 // AppendEntriesRequest.
 type AppendEntriesResponse struct {
@@ -75,6 +88,7 @@ type AppendEntriesResponse struct {
 	DataMissingFrom uint64
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *AppendEntriesResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -101,6 +115,7 @@ type RequestVoteRequest struct {
 	LeadershipTransfer bool
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *RequestVoteRequest) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -122,6 +137,7 @@ type RequestVoteResponse struct {
 	Granted bool
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *RequestVoteResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -140,6 +156,7 @@ type RequestPreVoteRequest struct {
 	LastLogTerm  uint64
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *RequestPreVoteRequest) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -156,6 +173,7 @@ type RequestPreVoteResponse struct {
 	Granted bool
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *RequestPreVoteResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -189,6 +207,7 @@ type InstallSnapshotRequest struct {
 	Size int64
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *InstallSnapshotRequest) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -203,6 +222,7 @@ type InstallSnapshotResponse struct {
 	Success bool
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *InstallSnapshotResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -214,6 +234,7 @@ type TimeoutNowRequest struct {
 	RPCHeader
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *TimeoutNowRequest) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
@@ -224,6 +245,7 @@ type TimeoutNowResponse struct {
 	RPCHeader
 }
 
+// GetRPCHeader 返回本消息携带的 RPCHeader, 用于实现 WithRPCHeader 接口。
 // GetRPCHeader - See WithRPCHeader.
 func (r *TimeoutNowResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader

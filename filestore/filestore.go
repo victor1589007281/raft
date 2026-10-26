@@ -62,8 +62,13 @@ type RedoCodec interface {
 // The payload is Data itself; Merge is the identity.
 type IndexLSNCodec struct{}
 
+// Split 是 IndexLSNCodec 的演示实现: lsn 直接取 raft index, 使稀疏索引在
+// 没有真实 redo 消费方时也能被完整验证 (LookupByLSN(i)==i); payload 就是
+// Data 本身, 不做 envelope 拆分。
 func (IndexLSNCodec) Split(l *raft.Log) (uint64, uint64, []byte) { return 0, l.Index, l.Data }
-func (IndexLSNCodec) Merge(_, _ uint64, payload []byte) []byte   { return payload }
+
+// Merge 是 Split 的逆: IndexLSNCodec 下 payload 即 Data, 原样返回(恒等)。
+func (IndexLSNCodec) Merge(_, _ uint64, payload []byte) []byte { return payload }
 
 // RedoSegment is one redo record's worth of payload, addressed by LSN.
 type RedoSegment struct {
@@ -80,6 +85,25 @@ type RedoSegmentCodec interface {
 	RedoCodec
 	SplitSegments(data []byte) (base uint64, segs []RedoSegment)
 	MergeSegments(base uint64, segs []RedoSegment) []byte
+}
+
+// RedoShapeCodec is the optional shape extension of RedoCodec used by v2
+// unified records. SplitShape is Split plus isRedo: it tells the file layer
+// whether payload is a split redo segment (Data must be rebuilt by Merge on
+// reload) or opaque entry data (control commands such as checkpoint/lease/
+// catalog: reload must return the payload verbatim, NOT re-envelope it).
+//
+// 为什么需要它: 旧契约里 Merge 恒被调用, 业务 codec 只能无条件重包信封 ——
+// 对控制命令(0 段)就会凭空多出一层 redo 信封(unified 重载损坏控制命令)。
+// 用记录级 flags 持久化形状后, 重载侧才能区分「redo 段」与「原样字节」。
+//
+// 兼容性: 未实现本接口的 codec 沿用旧行为 —— encodeV2 写 flags=0(无形状
+// 信息), 重载对每条记录仍调用 Merge(与修复前逐字节一致)。
+type RedoShapeCodec interface {
+	RedoCodec
+	// SplitShape 等价于 Split, 额外报告 payload 是否由 redo 信封拆出。
+	// isRedo=false 时 payload 必须就是原始 Data(重载侧原样还原)。
+	SplitShape(data []byte) (base, lsn uint64, payload []byte, isRedo bool)
 }
 
 // Mode selects the on-disk store layout for NEW files (existing files always
@@ -121,6 +145,9 @@ type Options struct {
 	Logger *log.Logger // optional; nil = silent
 }
 
+// Validate 校验开关之间的互锁(对齐 raft.Config.Validate): IORingSQPoll 必须
+// 挂在 IORing 上, Mode 只接受 ""/unified/ref。刻意不把 SparseIndex 绑到
+// SingleWAL —— 格式跟随文件, 关掉写开关后仍须能索引既有的 v2 文件(滚动重启兼容)。
 // Validate enforces the switch interlocks (mirrors raft.Config.Validate).
 // SparseIndex is deliberately NOT tied to SingleWAL here: the format follows
 // the file, so a v2 file must be indexable even when the SingleWAL write
@@ -135,6 +162,8 @@ func (o Options) Validate() error {
 	return nil
 }
 
+// resolvedMode 把 (Mode, SingleWAL) 开关对折算成新建文件的实际布局: Mode
+// 显式指定优先, 否则 SingleWAL ⇒ unified, 全关 ⇒ legacy。
 // resolvedMode maps the switch pair to the effective new-file layout.
 func (o Options) resolvedMode() Mode {
 	if o.Mode != "" {
@@ -159,11 +188,15 @@ func (o Options) resolvedMode() Mode {
 // v2 record (records start at offset 512):
 //
 //	[u32 totalLen]                     // = 24 + raftLen + dataLen + 4(crc)
-//	[u16 ver=2][u16 flags]
+//	[u16 ver=2][u16 flags]             // flags: bit0 recFlagRedo / bit1 recFlagShapeKnown
 //	[u64 base][u64 lsn]
 //	[u32 raftLen][msgpack(Log without Data)]
 //	[payload]
 //	[u32 crc32c over bytes [4 .. 4+totalLen-4)]
+//
+// flags 是记录级形状标志(与文件头 flags 无关): bit1=0 是修复前的旧记录, 重载
+// 按旧语义恒走 Codec.Merge; bit1=1 时 bit0 决定 payload 是 redo 段(需 Merge
+// 重建信封)还是原样字节(控制命令)。旧记录不需要迁移, 与带标志的新记录可混存。
 //
 // Batch: records concatenated, then zero padding to the next 512 B boundary.
 // Padding is never part of any record; reload treats a zero u32 at a record
@@ -185,6 +218,19 @@ const (
 
 	fileFlagSingleWAL = 1 << 0
 	fileFlagPad512    = 1 << 1
+
+	// v2 记录级 flags(body[2:4], 与文件头 flags 无关), 由 encodeV2 写入、
+	// decodeV2 解读:
+	//   recFlagRedo       payload 是 redo 段: 重载时 Data = Codec.Merge(base,lsn,payload)
+	//   recFlagShapeKnown recFlagRedo 有效(新写者)。旧记录 flags==0 ⇒ 形状未知,
+	//                     重载保持旧行为(恒 Merge), 保证既有磁盘文件逐字节可读。
+	// 旧文件里的控制命令没有形状标志, 无法无歧义恢复(redo 段的 base/lsn 都可以
+	// 是 0, 不能用 0 值猜), 仍按旧语义重载; 新写记录一律带 shape 标志。
+	// 降级注意: 旧二进制忽略记录 flags(恒 Merge), 读新文件里的控制命令仍会包
+	// 一层 redo 信封 —— 回滚到修复前版本会重新暴露该 bug, 故不做格式版本升级,
+	// 只让新读者按记录区分(新旧记录在文件里可共存)。
+	recFlagRedo       = 1 << 0
+	recFlagShapeKnown = 1 << 1
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -212,6 +258,8 @@ type scanStats struct {
 	holesBytes int64 // bytes covered by tolerated skips
 }
 
+// scanRecords 从 start 起顺序走 [u32 len][body] 记录, 返回好数据终点(下一次
+// 追加的位置); 只读扫描, 不落盘 —— 重载、空洞治愈与撕尾截断都以它为准。
 // scanRecords walks [u32 len][body] records starting at start. When
 // padBatches (v2 formats), a zero length at a record boundary is batch-tail
 // padding: skip to the next 512B boundary (off advances even on break so
@@ -230,6 +278,23 @@ type scanStats struct {
 //   - 零块一路到 EOF = 批尾填充, 数据终点(批对齐不变量保留)。
 //
 // 返回好数据终点(下一追加位置)。
+// 算法解读：
+//
+//	原理：逐 512B 块推进。读到非零长度头就按 [u32 len][body] 取一条记录交给
+//	  yield 解码; 读到零长度头(且 padBatches)则视为批尾填充或零洞, 向后吞掉
+//	  连续零块直到非零块头或 EOF。零区之后若跟的是可解码记录, 说明它是被治愈
+//	  的洞; 若解码失败(errScanStop)则停在坏块头前, 与旧撕尾语义一致。
+//	关键不变量：off 与返回的 endOff 恒 512 对齐 —— 零洞判别式
+//	  (zeroStart%512==0 || pendingZero>=512)正是靠它区分"批尾部分槽填充"与
+//	  "WriteRedoDirect 回滚留下的整段保留槽"; 好数据终点之前绝不允许丢弃
+//	  已提交 meta 引用的字节, 否则触发 cascade truncate → GetLog not-found
+//	  → commit=0 死锁家族。
+//	代价与边界：O(文件字节), 一次线性扫描; 判别式只在"零区后紧跟记录"时生效,
+//	  零区一路到 EOF 一律判为数据终点(批尾填充), 故被截断的洞会停在最后一个
+//	  完整块边界。非 512 对齐的零头保持旧语义(直接判终点), 不把未知格式当洞治愈。
+//	设计权衡：旧启发式"两个连续零段 = 终点"在 #163 指纹(批尾填充零段紧邻回滚
+//	  洞零段)下提前 break, 会丢光洞后一切已提交 meta。改为逐块判定, 是用一次
+//	  额外解码尝试换取"绝不因启发式误判而丢数据"。
 func scanRecords(raw []byte, start int64, padBatches bool, yield func(off int64, body []byte) error) (int64, scanStats, error) {
 	buf := bytes.NewReader(raw[start:])
 	off := start
@@ -364,6 +429,9 @@ type Store struct {
 
 var _ raft.LogStore = (*Store)(nil)
 
+// Open 打开(或创建) dir 下的日志存储并重载内容; 磁盘格式自动探测, opts 的
+// SingleWAL/Mode 只影响本次调用新建的文件。ref 模式下 dir 内还有数据文件
+// redo.log。reload 后按需做 O_DIRECT 探测(仅 v2 格式), 失败即回退缓冲。
 // Open opens (or creates) the log store in dir and reloads its contents.
 // The on-disk format is auto-detected; opts.SingleWAL/Mode only affect files
 // created by this call. In ref mode dir also holds redo.log (the data file).
@@ -457,6 +525,8 @@ func Open(dir string, opts Options) (*Store, error) {
 
 	// O_DIRECT tier: only for v2 formats (batch-tail padding guarantees
 	// offset/length alignment); probed per file, falls back to buffered.
+	// 只对 v2 格式探测: 批尾 512B 填充保证了偏移/长度对齐, 这是 O_DIRECT 的前提;
+	// 探测失败不报错 —— 静默退回 buffered(s.directIO 保持 false)。
 	if opts.DirectIO && (s.format == "v2-singlewal" || s.format == "v2-ref") {
 		if df, ok := reprobeDirect(path, f, opts.Logger); ok {
 			s.f = df
@@ -481,8 +551,24 @@ func Open(dir string, opts Options) (*Store, error) {
 	return s, nil
 }
 
+// reprobeDirect 用 O_DIRECT 重开 path 并做一次对齐 pwrite 探测; 任何一步失败
+// 都静默回退缓冲模式(探测回退), 绝不让不支持 O_DIRECT 的盘把存储开死。
 // reprobeDirect reopens path with O_DIRECT and probes an aligned pwrite.
 // On any failure the store stays buffered (探测回退).
+// 算法解读：
+//
+//	原理：Stat 取原文件长度 → 以 O_DIRECT 重开 → 在 1MiB 处写一个 512B 对齐
+//	  缓冲 → 成功后 Truncate 回原长度。探测点选在 1MiB 而非偏移 0, 是为了
+//	  绝不碰头部 512B 的 magic/header。
+//	关键不变量：探测写必须 512B 对齐且长度对齐 —— 未对齐的 O_DIRECT 写会
+//	  EINVAL, 会被误判成"盘不支持"而白白退回缓冲; Truncate 回 info.Size()
+//	  必须成功, 否则文件被撑大, 尾部多出的零会被扫描器当批尾填充吞掉。
+//	代价与边界：每个文件一次探测写 + 一次 ftruncate, 只在 Open 时付一次。
+//	  注意探测点是固定的 1MiB: 文件已超过 1MiB 时, 这 512B 探测写会覆盖真实
+//	  字节, 而 Truncate 回原长度并不能恢复它们(见汇报里的"发现的问题")。
+//	设计权衡：O_DIRECT 在部分文件系统/内核组合上只是"打开成功但写失败",
+//	  故必须真写一次才能判定; 用探测回退而不是硬失败, 让同一份配置能在
+//	  tmpfs/NFS/overlayfs 上照常跑(只是退回 buffered)。
 func reprobeDirect(path string, cur *os.File, logger *log.Logger) (*os.File, bool) {
 	info, err := cur.Stat()
 	if err != nil {
@@ -496,6 +582,9 @@ func reprobeDirect(path string, cur *os.File, logger *log.Logger) (*os.File, boo
 		return nil, false
 	}
 	buf := alignedBytes(512)
+	// 1MiB 是选定的探测点: 远超常规数据区(避免碰头部 magic), 写完立刻 Truncate
+	// 回原长度抹掉。注意: 文件本身已 >1MiB 时这 512B 写会覆盖真实字节, 且
+	// Truncate 回同长度无法恢复(见汇报的"发现的问题")。
 	probeAt := int64(1 << 20) // beyond any real data; truncated back afterwards
 	if _, err := df.WriteAt(buf, probeAt); err != nil {
 		_ = df.Close()
@@ -508,6 +597,8 @@ func reprobeDirect(path string, cur *os.File, logger *log.Logger) (*os.File, boo
 	return df, true
 }
 
+// Format 返回探测到的磁盘格式("v2-singlewal"/"v2-ref"/"v1-singlewal"/"legacy"),
+// 它是文件自身的格式, 与当前开关无关。持 RLock。
 // Format returns the detected on-disk format ("v2-singlewal" / "v1-singlewal" /
 // "legacy") — the file's own format, independent of the current switches.
 func (s *Store) Format() string {
@@ -522,6 +613,9 @@ func (s *Store) Format() string {
 // 也保证 StoreLogs 连续性护栏永不误伤合法的快照重接。
 func (s *Store) IsMonotonic() bool { return true }
 
+// Close 先 Sync 主文件与 redo.log, 再取 redoIoMu 写锁等锁外读者(mergeEntry/
+// ReadRedo*)的 in-flight ReadAt 收工后关 fd; 任一 Sync 失败即提前返回, 不保证
+// 后续句柄都被关闭。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -542,6 +636,7 @@ func (s *Store) Close() error {
 	return s.f.Close()
 }
 
+// lastIndexLocked 返回最后一条日志的 index, 空日志返回 0。调用方须持有 s.mu。
 func (s *Store) lastIndexLocked() uint64 {
 	if len(s.logs) == 0 {
 		return 0
@@ -552,6 +647,8 @@ func (s *Store) lastIndexLocked() uint64 {
 // ---------------------------------------------------------------------------
 // Encoding.
 
+// encodeLogMsgpack 用 msgpack 编码一条 raft.Log(调用方须已把 Data 摘掉), 供
+// legacy/v1/v2 三条编码路径复用。
 func encodeLogMsgpack(l *raft.Log) ([]byte, error) {
 	var buf []byte
 	if err := codec.NewEncoderBytes(&buf, &msgpackHandle).Encode(l); err != nil {
@@ -560,14 +657,40 @@ func encodeLogMsgpack(l *raft.Log) ([]byte, error) {
 	return buf, nil
 }
 
+// encodeV2 构造一条 v2 记录: codec 把 Data 拆成 envelope(base/lsn, 存进原生
+// 头部字段)与 payload(存在 raft msgpack 头之后), 同一份字节同时服务 raft 视图
+// (GetLog)与 redo 视图(LookupByLSN/裸扫描), 数据不重复落盘。
 // encodeV2 builds one v2 record. The codec splits Data into envelope
 // (base/lsn, stored in native header fields) and payload (stored after the
 // raft msgpack header), so the same bytes serve the raft view (GetLog) and
 // the redo view (LookupByLSN / raw scan) without duplication.
+// 算法解读：
+//
+//	原理：布局 = [u32 totalLen][u16 ver=2][u16 flags][u64 base][u64 lsn]
+//	  [u32 raftLen][msgpack(Log 去掉 Data)][payload][u32 crc32c]。CRC 覆盖
+//	  [4 .. len-4), 即除长度字段外的全部字节 —— 长度字段自身不参与校验,
+//	  因为扫描器必须先读它才能知道记录边界。
+//	关键不变量：totalLen = (recHeaderV2-4) + raftLen + payloadLen + 4, 与实际
+//	  写入长度必须一致, 否则下一条记录的起点整体错位; base/lsn 是原生字段而非
+//	  msgpack 内嵌, 使 redo 视图无需解码 msgpack 即可定位。
+//	代价与边界：一次 msgpack 编码 + 一次全记录 CRC32C(软件表), payload 走 copy
+//	  而非零拷贝; nil codec 时 base=lsn=0, payload=Data, 稀疏索引因 lsn==0 跳过。
+//	设计权衡：把 envelope 提到原生字段而不是塞进 msgpack, 换来 redo 侧零解码
+//	  读取与可算的记录长度(512 对齐的前提, O_DIRECT 需要); 代价是格式不自
+//	  描述, 必须靠文件头 magic + ver 判定。
 func (s *Store) encodeV2(l *raft.Log) (rec []byte, base, lsn uint64, err error) {
 	payload := l.Data
+	// isRedo 决定重载侧是否用 Codec.Merge 重建 Data。优先问 RedoShapeCodec
+	// (控制命令 ⇒ false, payload 就是原 Data); 未实现时沿用旧语义
+	// (payload 恒视为 redo 段 ⇒ 重载仍走 Merge, 与修复前结果一致)。
+	isRedo := false
 	if s.opts.Codec != nil {
-		base, lsn, payload = s.opts.Codec.Split(l)
+		if sc, ok := s.opts.Codec.(RedoShapeCodec); ok {
+			base, lsn, payload, isRedo = sc.SplitShape(l.Data)
+		} else {
+			base, lsn, payload = s.opts.Codec.Split(l)
+			isRedo = true
+		}
 	}
 	tmp := *l
 	tmp.Data = nil
@@ -579,7 +702,13 @@ func (s *Store) encodeV2(l *raft.Log) (rec []byte, base, lsn uint64, err error) 
 	rec = make([]byte, 4+totalLen)
 	binary.LittleEndian.PutUint32(rec[0:4], uint32(totalLen))
 	binary.LittleEndian.PutUint16(rec[4:6], formatV2)
-	binary.LittleEndian.PutUint16(rec[6:8], 0)
+	// 记录级形状标志(见 recFlagShapeKnown): 无 codec 时 payload 恒为原 Data,
+	// 同样标记为「形状已知 + 非 redo」, 供日后带 codec 重开时原样还原。
+	flags := uint16(recFlagShapeKnown)
+	if isRedo {
+		flags |= recFlagRedo
+	}
+	binary.LittleEndian.PutUint16(rec[6:8], flags)
 	binary.LittleEndian.PutUint64(rec[8:16], base)
 	binary.LittleEndian.PutUint64(rec[16:24], lsn)
 	binary.LittleEndian.PutUint32(rec[24:28], uint32(len(raftBuf)))
@@ -590,6 +719,8 @@ func (s *Store) encodeV2(l *raft.Log) (rec []byte, base, lsn uint64, err error) 
 	return rec, base, lsn, nil
 }
 
+// encodeV1 构造一条原型期 v1 记录(无 CRC、无 512 填充), 只用于向既有的 v1
+// 文件继续追加以免格式混用; 永不新建 v1 文件。
 // encodeV1 builds a prototype v1 record (no CRC, no padding) — used only to
 // keep appending to existing v1 files without format mixing.
 func (s *Store) encodeV1(l *raft.Log) (rec []byte, lsn uint64, err error) {
@@ -616,7 +747,23 @@ func (s *Store) encodeV1(l *raft.Log) (rec []byte, lsn uint64, err error) {
 	return rec, lsn, nil
 }
 
+// decodeV2 校验并解码一条 v2 记录体(totalLen 之后的字节): 先比 CRC32C, 再按
+// raftLen 切出 msgpack 与 payload, 再按记录级 flags 决定还原 Data 的方式:
+// 控制命令(shape 已知且非 redo)原样取 payload; redo 段与旧记录(flags==0)
+// 交给 codec.Merge 重建业务信封。
 // decodeV2 verifies and decodes one v2 record body (bytes after totalLen).
+// 算法解读：
+//
+//	原理：CRC32C(castagnoli) 校验整条记录体, 不符即报错 —— 调用方(scanRecords
+//	  的 yield)把它翻成 errScanStop, 于是撕裂/损坏记录成为截断点, 而不是读出
+//	  错数据。
+//	关键不变量：payload 与 msgpack 段必须各自 copy 出来(append(nil, ...)),
+//	  不能引用 raw 缓冲 —— raw 是整文件读入的切片, 长命引用会把整个文件钉在
+//	  内存里。
+//	代价与边界：raftLen 越界(为负或超出记录体)即拒; 短记录(< 头+尾)即拒。
+//	  CRC 是软件表实现, 大 payload 时是纯 CPU 开销。
+//	设计权衡：用 CRC32C 而不是更强的摘要, 因为它的目的是抓"撕裂/半写尾"而非
+//	  防篡改; Castagnoli 在多平台有硬件指令, 代价最低。
 func (s *Store) decodeV2(body []byte) (*raft.Log, uint64, error) {
 	if len(body) < recHeaderV2-4+recTrailV2 {
 		return nil, 0, errors.New("short v2 record")
@@ -630,6 +777,7 @@ func (s *Store) decodeV2(body []byte) (*raft.Log, uint64, error) {
 	if raftLen < 0 || raftLen > len(body)-(recHeaderV2-4)-recTrailV2 {
 		return nil, 0, errors.New("bad raftLen")
 	}
+	flags := binary.LittleEndian.Uint16(body[2:4])
 	base := binary.LittleEndian.Uint64(body[4:12])
 	lsn := binary.LittleEndian.Uint64(body[12:20])
 	raftBody := body[recHeaderV2-4 : recHeaderV2-4+raftLen]
@@ -638,14 +786,25 @@ func (s *Store) decodeV2(body []byte) (*raft.Log, uint64, error) {
 	if err := codec.NewDecoderBytes(raftBody, &msgpackHandle).Decode(l); err != nil {
 		return nil, 0, err
 	}
-	if s.opts.Codec != nil {
-		l.Data = s.opts.Codec.Merge(base, lsn, append([]byte(nil), payload...))
-	} else {
+	switch {
+	case s.opts.Codec == nil:
 		l.Data = append([]byte(nil), payload...)
+	case flags&recFlagShapeKnown != 0 && flags&recFlagRedo == 0:
+		// 形状已知且非 redo 段: payload 就是原始 Data(控制命令 checkpoint/
+		// lease/catalog)。必须原样返回 —— 走 Merge 会凭空包一层 cmdSingle,
+		// FSM 会把控制命令当 redo 追加成垃圾。
+		l.Data = append([]byte(nil), payload...)
+	default:
+		// redo 段, 或旧记录(flags==0, 形状未知): 沿用旧行为, 由 codec 重建
+		// 业务信封。旧文件因此保持逐字节可读(redo 正确; 旧控制命令仍是旧
+		// 语义, 见 recFlagShapeKnown 注释)。
+		l.Data = s.opts.Codec.Merge(base, lsn, append([]byte(nil), payload...))
 	}
 	return l, lsn, nil
 }
 
+// decodeV1 读取一条原型期 v1 记录(无 CRC, 无填充), 只读兼容用 —— 损坏只能靠
+// msgpack 解码失败或长度越界发现, 没有校验和兜底。
 // decodeV1 reads a prototype v1 record (no CRC) — read-only compatibility.
 func decodeV1(body []byte) (*raft.Log, uint64, error) {
 	if len(body) < recHeaderV2-4 {
@@ -664,8 +823,12 @@ func decodeV1(body []byte) (*raft.Log, uint64, error) {
 	return l, lsn, nil
 }
 
+// align512 把偏移向上取整到 512 的倍数 —— v2 记录与批尾填充都以 512 为粒度,
+// 这既是 O_DIRECT 对偏移/长度对齐的硬要求, 也是零洞判别式的基准。
 func align512(off int64) int64 { return (off + 511) &^ 511 }
 
+// reload 读入文件并按自动探测结果重建内存视图(first/logs/offsets/lsnIndex/
+// endOff/refSegs/refBases), 最后把游标停在好数据终点 —— 撕尾被下一次追加覆盖。
 // ---------------------------------------------------------------------------
 // Reload with format auto-detection and torn-tail handling.
 //
@@ -675,6 +838,20 @@ func align512(off int64) int64 { return (off + 511) &^ 511 }
 // so an operator can flip the switch without corrupting existing PVCs.
 // Ref mode reads redo.log (data authority) first, then the meta file, and
 // drops meta entries whose redo bytes were torn away (12.14.3 ③).
+// 算法解读：
+//
+//	原理：探测顺序 = v2 magic("VWAL" + major==2) → v1 嗅探(ver 字段==1) →
+//	  legacy。空文件才按开关铺 512B 头; 非空文件一律以文件自身格式为准。
+//	  v2-ref 先读 redo.log(数据权威)再读 meta, 丢弃 redo 字节已被撕掉的 meta 条目。
+//	关键不变量：格式一旦探明就同时约束"读"与"后续追加" —— 老 legacy 文件在
+//	  SingleWAL 打开后仍继续写 legacy 记录, 否则格式混用; first 取首条 index;
+//	  v2 的 endOff 恒 512 对齐; 重载末尾必须调 truncateAtGapLocked 把索引空洞
+//	  之上的后缀截掉, 否则 LastIndex 与 GetLog 不一致。
+//	代价与边界：整文件一次读入内存(readWhole), 大日志下是峰值内存的主要来源;
+//	  O_DIRECT 生效时走 readAtAligned 的对齐缓冲读。撕尾只截到最后一个完整
+//	  记录, 其后的字节由下一次追加覆盖。
+//	设计权衡：格式跟随文件而非跟随开关, 换来"运维翻开关不会毁掉既有 PVC";
+//	  代价是同一份代码要同时维护 4 条读写路径。
 func (s *Store) reload() error {
 	if err := s.f.Sync(); err != nil {
 		return err
@@ -800,6 +977,8 @@ func (s *Store) reload() error {
 		return err
 	}
 	s.endOff = goodEnd
+	// 重载后必做: 索引空洞之上的后缀对 raft 不可达, 必须截掉, 否则
+	// LastIndex/GetLog 会不一致。
 	s.truncateAtGapLocked()
 	// Park the cursor at the end of good data; reload reads via ReadAt and
 	// never moves it. A torn tail is simply overwritten by the next append.
@@ -813,6 +992,20 @@ func (s *Store) reload() error {
 // meta 文件 ftruncate(+v2 补零对齐), 保证 LastIndex/GetLog 一致。洞以上的后缀
 // 对 raft 不可达(processLogs 无法跨过洞 apply), 截断后由领导者按 prevLog 重铺。
 // 返回是否发生了截断。调用方须持有 s.mu(或处于 Open 单线程期)。
+// 算法解读：
+//
+//	原理：扫一遍 logs 找第一处 index 不连续(前一条+1 != 本条), 把内存视图切到
+//	  洞前, 并对 meta 文件 ftruncate 到洞起点(v2 再补零到 512 对齐), 同步清掉
+//	  index 大于保留下限的 lsnIndex 键。
+//	关键不变量：洞之上的后缀对 raft 不可达(processLogs 无法跨洞 apply), 故截断
+//	  既安全又必要; endOff 必须停在 512 对齐处, 否则下一次追加的记录头不对齐;
+//	  此处【不动 unbound 台账】—— 被截掉的 lsn 在绑定时刻已整条清账, 截断前
+//	  若有直发重发(重新挂账), 那仍是盘上真实未绑定字节, 由 CompactRedo 回收
+//	  其字节时一并清账。
+//	代价与边界：O(len(logs) + len(lsnIndex)), 只在重载/追加发现洞时跑; 只处理
+//	  第一处洞(其后内容一律丢弃), 因为再往后已无法与 raft 对齐。
+//	设计权衡：截断(丢后缀)而不是留洞等领导者补 —— 位置式存储无法表示中间空洞,
+//	  留洞会让位置算术命中错误条目(GetLog 的洞检测正是为此设的)。
 func (s *Store) truncateAtGapLocked() bool {
 	for i := 1; i < len(s.logs); i++ {
 		if s.logs[i].Index == s.logs[i-1].Index+1 {
@@ -854,6 +1047,8 @@ func (s *Store) truncateAtGapLocked() bool {
 	return false
 }
 
+// writeFileHeader 在偏移 0 写下 512B 的 v2 头(magic + major + flags)随即 Sync
+// —— 头必须先于任何记录落盘, 否则重启会把文件判成 legacy。
 // writeFileHeader lays down the 512 B v2 header.
 func writeFileHeader(f *os.File, flags uint16) error {
 	hdr := make([]byte, fileHeaderLen)
@@ -866,6 +1061,8 @@ func writeFileHeader(f *os.File, flags uint16) error {
 	return f.Sync()
 }
 
+// readWhole 从偏移 0 读满 size 字节; O_DIRECT 生效时走对齐缓冲读, 否则一次
+// ReadAt(容忍 io.EOF)。size==0 直接返回 nil。
 // readWhole reads size bytes from f at offset 0, honoring O_DIRECT alignment.
 func (s *Store) readWhole(f *os.File, size int64) ([]byte, error) {
 	if size == 0 {
@@ -881,9 +1078,48 @@ func (s *Store) readWhole(f *os.File, size int64) ([]byte, error) {
 	return raw, nil
 }
 
+// StoreLogs 追加一批日志并只做一次持久化屏障(raft 的持久化契约正是"StoreLogs
+// 返回时已在盘上")。落盘前强制连续性护栏, 并把"与既有条目逐字节一致的重叠批"
+// 识别为幂等重写吸收掉。
 // ---------------------------------------------------------------------------
 // StoreLogs: append a batch + one durability barrier (raft's durability
 // contract is exactly "on disk when StoreLogs returns").
+// 算法解读：
+//
+//	原理：先过两道连续性检查 —— (a) 批首必须等于 store last+1, 否则可能是洞
+//	  或改写; (b) 批内相邻 index 必须连续。(a) 里若 got < want(重叠窗口), 逐条
+//	  比对 Index+Term(内容仅在【两侧都是 inline 字节】时才比), 全等即判幂等
+//	  重写, 剥掉重叠前缀只追加真正新的尾巴; 整批都是重投则 no-op 返回。
+//	关键不变量：护栏必须在【落盘前】炸响 —— 历史上 v2-ref 在高并发 + 快照压实
+//	  窗口写出过一个索引洞(75304→75306)且一路静默, 直到 apply GetLog panic 才
+//	  暴露。got > want 恒硬拒(真空洞)。
+//
+// ★三种边界(2026-10-24 补, 40k DDL 档误 stepdown 实证)：
+//
+//	① batch first <= store last, 且重叠条目 (index,term,内容) 一致
+//	   ⇒ 幂等重写(重试批/分批边界/异步写者重派都会产生它 —— 它不是洞),
+//	     剥掉重叠前缀、只追加新尾; 整批被覆盖则 no-op 成功。
+//	② batch first <= store last, 但同一 index 的 term/内容真不一致
+//	   ⇒ 真冲突(日志分叉/内容改写) ⇒ fail-loud, 绝不让它静默覆盖。
+//	③ batch first > store last+1 ⇒ 真空洞 ⇒ 保持拒绝。
+//
+//	「内容一致」的判定必须【形态感知】(见 entryDataForm):
+//	  - 两侧都 inline   ⇒ 先经 canonicalEntryData 归一, 再逐字节比。归一化是
+//	    必需的: 编解码往返只保证语义等价, 不保证字节相等(单段 cmdBatch 会
+//	    归一成 cmdSingle; v2 重载也走 Codec.Merge 重建 Data)。
+//	  - 两侧都是 ref redo ⇒ 比【段清单(base + LSN 序列)】这一个编码无关的
+//	    语义指纹, 零读盘即可判真冲突。
+//	  - 一侧是指针层(省略标记/Data=nil)或已被压实 ⇒ 字节不可比, 只信
+//	    (index,term)。
+//	  拿指针形态/归一形态直接 bytes.Equal 必然误报, 而误报的代价是
+//	  asyncWriteFailed 永久置坏 ⇒ leader step down ⇒ 长征楔死(2026-10-24 现场)。
+//
+//	代价与边界：重叠窗口的比对是 O(overlap); inline 分支多一次归一化(有 codec
+//	  时 split→merge, 无 codec 时零拷贝), ref 分支只比 LSN 列表(不读盘)。
+//	  护栏本身是"正常情况永不触发"的检查。
+//	设计权衡：宽容幂等重写(而非 fail-closed)是因为行军 40k 档实测到 leader 在
+//	  正常任期收到 first==last 的重写批(疑似异步写者重派), 一炸就 asyncWriteFailed
+//	  永久置坏 → leader step down → 长征楔死。
 func (s *Store) StoreLogs(logs []*raft.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -897,37 +1133,67 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 	if len(s.logs) > 0 {
 		if want, got := s.lastIndexLocked()+1, logs[0].Index; got != want {
 			// ★幂等重写宽容(2026-10-02 实证: 行军 40k 档 leader 在正常任期中收到
-			//   first==last 的重写批 —— 疑似异步写者路径的重派; 原先一炸 ⇒
-			//   asyncWriteFailed 永久置坏 ⇒ leader step down ⇒ 长征楔死):
-			//   与既有条目【逐字节一致】(Index/Term/Data)的重叠是幂等重写 ——
-			//   raft 日志匹配原则下语义 = no-op ⇒ 剥掉重叠只追加新尾。
-			//   任一条目不一致 ⇒ 真冲突(洞/改写) ⇒ 维持 fail-closed。
+			//   first==last 的重写批 —— 异步写者重派/重试会重发整批; 2026-10-24 又
+			//   在 40k DDL 档命中"重叠批 term 相同却被判内容冲突"的误报):
+			//   与既有条目【语义一致】的重叠是幂等重写 —— raft 日志匹配原则下
+			//   语义 = no-op ⇒ 剥掉重叠只追加新尾。
+			//   任一条目在 (index,term,可比内容) 上不一致 ⇒ 真冲突 ⇒ 维持 fail-closed。
 			if got < want { // 重写/重叠窗口: first <= last
 				overlap := want - got // 重叠条数 = last+1-first
-				// 比对口径: Index+Term 恒比; Data 仅在两侧都可比(非 ref 指针形态)时比。
-				// raft 语义下 (index,term) 唯一决定内容(同 term 同 index 不同数据 =
-				// 拜占庭, 正确 raft 永不产生), 故 Index+Term 全等对重写判定已充分;
-				// Data 比对是便宜处的锦上添花。护栏的本职(索引洞/越界跳)不受影响:
-				// got > want 仍硬拒, Index/Term 不一致仍硬拒。
+				// 比对口径: Index+Term 恒比; Data 仅在【两侧都是 inline 字节】时比。
+				// 见函数头"三种边界": 指针/省略/归一形态的字节比较必然误报, 而误报
+				// 会把 leader 无谓地 step down, 所以宁可退到 (index,term) 判据。
 				// 实现注: 这里【不能】调 GetLog —— 它持 RLock(本函数已持写锁,
 				// Go 互斥锁不可重入)且 ref 路径会做锁移交(交出 s.mu)。
 				// peekLogMetaLocked 是纯内存的元数据读取, 无移交。
 				allSame := true
-				var missIn, missPrev uint64
+				var detail string
 				for i := uint64(0); i < overlap && int(i) < len(logs); i++ {
-					prev, err := s.peekLogMetaLocked(logs[i].Index)
+					in := logs[i]
+					// 已被压实回收的前缀: raft 只压【已提交】前缀, 这些条目的字节
+					// 已从 meta 里物理删掉 —— 无可比, 按幂等 no-op 跳过(不是洞)。
+					if s.first != 0 && in.Index < s.first {
+						continue
+					}
+					prev, prevForm, err := s.peekLogMetaLocked(in.Index)
 					if err != nil {
 						allSame = false
+						detail = fmt.Sprintf("stored entry %d unreadable (%v)", in.Index, err)
 						break
 					}
-					if prev.Index != logs[i].Index || prev.Term != logs[i].Term {
+					if prev.Index != in.Index || prev.Term != in.Term {
 						allSame = false
-						missIn, missPrev = logs[i].Term, prev.Term
+						detail = fmt.Sprintf("index/term conflict at %d: incoming term=%d stored term=%d",
+							in.Index, in.Term, prev.Term)
 						break
 					}
-					if len(prev.Data) > 0 && !bytes.Equal(prev.Data, logs[i].Data) {
-						allSame = false
-						missIn, missPrev = logs[i].Term, prev.Term
+					inForm := s.incomingDataFormLocked(in)
+					switch {
+					case prevForm == dataFormInline && inForm == dataFormInline:
+						// 两侧字节都在各自记录里 ⇒ 归一后逐字节比。
+						if !bytes.Equal(s.canonicalEntryData(prev.Data), s.canonicalEntryData(in.Data)) {
+							allSame = false
+							detail = fmt.Sprintf("content conflict at %d (term=%d): incoming %dB[%s] stored %dB[%s]",
+								in.Index, in.Term, len(in.Data), inForm, len(prev.Data), prevForm)
+						}
+					case prevForm == dataFormRefPointer && inForm == dataFormRefPointer:
+						// 两侧都是 ref redo 条目: 字节在 redo.log, 但【段清单
+						// (base + LSN 序列)是编码无关的语义指纹】—— 同一逻辑命令
+						// 写成批信封还是单条信封, 段清单都一样; 而不同内容必然
+						// 出现不同的 base/LSN 或不同段数。零读盘即可判真冲突。
+						prevBase, prevLSNs, ok := s.storedRedoSegsLocked(in.Index)
+						inBase, inSegs := s.splitEntry(in)
+						if !ok || prevBase != inBase || !equalRedoLSNs(prevLSNs, inSegs) {
+							allSame = false
+							detail = fmt.Sprintf("redo segment conflict at %d (term=%d): incoming base=%d lsns=%v stored base=%d lsns=%v",
+								in.Index, in.Term, inBase, redoLSNsOf(inSegs), prevBase, prevLSNs)
+						}
+					default:
+						// 一侧是指针层(elided)/空字节/已被压实: 无可比字节。
+						// raft 日志匹配原则下 (index,term) 即唯一判据 ⇒ 幂等放行。
+						continue
+					}
+					if !allSame {
 						break
 					}
 				}
@@ -939,8 +1205,8 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 					// 剥掉重叠前缀, 只追加真正新的尾巴
 					logs = logs[overlap:]
 				} else {
-					return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole (overlap content mismatch: incoming term=%d stored term=%d)",
-						want-1, got, len(logs), missIn, missPrev)
+					return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write (overlap mismatch: %s)",
+						want-1, got, len(logs), detail)
 				}
 			} else {
 				return fmt.Errorf("filestore: non-contiguous append: store last=%d, batch first=%d (len=%d) — refusing to write a hole",
@@ -970,6 +1236,8 @@ func (s *Store) StoreLogs(logs []*raft.Log) error {
 	return s.storeLogsLegacy(logs)
 }
 
+// storeLogsV1 向原型期 v1 文件继续追加 v1 记录(无 CRC、无批尾填充), 逐条 Write
+// 后一次 barrier。永不新建 v1 文件。
 // storeLogsV1 keeps appending v1-format records to a prototype-era file
 // (no CRC, no batch padding). New v1 files are never created.
 func (s *Store) storeLogsV1(logs []*raft.Log) error {
@@ -1003,9 +1271,25 @@ func (s *Store) storeLogsV1(logs []*raft.Log) error {
 	return s.barrier()
 }
 
+// storeLogsV2 把整批编成 v2 记录、拼接、批尾补零到 512B, 用一次 write + 一次
+// barrier(或一次 io_uring enter)持久化 —— Data 字节恰好落盘一次, 这是 12.14
+// 的单拷贝点。
 // storeLogsV2 encodes the batch as v2 records, concatenates, pads the batch
 // tail to 512 B, and persists with one write + one barrier (or one io_uring
 // enter). Data bytes land exactly once — this is the 12.14 single-copy point.
+// 算法解读：
+//
+//	原理：编码进 bytes.Buffer → 补零到 512 边界 → (O_DIRECT 时拷进对齐缓冲)
+//	  → 优先 io_uring 单 enter 链(WRITE→FSYNC), 失败即回落到 classic Write +
+//	  barrier → 最后 commitBatch 推进内存视图。
+//	关键不变量：批尾补零长度 = align512(len)-len, 使下一次追加的 baseOff 仍
+//	  512 对齐(O_DIRECT 与零洞判别式都依赖它); baseOff 必须在写之前抓拍
+//	  (s.endOff), 因为 commitBatch 会改写它; io_uring 失败必须完整回落到经典
+//	  路径, 不能半途而废。
+//	代价与边界：整批一次内存拷贝(单拷贝点), 批越大越省 syscall 但内存峰值越高;
+//	  一批一次 fsync, 批越小 fsync 次数越多(这正是组提交窗口的收益来源)。
+//	设计权衡：用"一次写整批 + 一次屏障"而不是逐条写 —— raft 的持久化契约只
+//	  要求 StoreLogs 返回时整批在盘上, 逐条 fsync 是纯浪费。
 func (s *Store) storeLogsV2(logs []*raft.Log) error {
 	lsns := make([]uint64, len(logs))
 	var batch bytes.Buffer
@@ -1017,6 +1301,9 @@ func (s *Store) storeLogsV2(logs []*raft.Log) error {
 		lsns[i] = lsn
 		batch.Write(rec)
 	}
+	// pad512 的来历: O_DIRECT 要求偏移与长度都按块(512B)对齐, 且零洞判别式
+	// 依赖"记录与填充都是 512 对齐"; 故每批尾部补零到下一个 512 边界, 使下
+	// 一批的 baseOff 仍对齐。
 	if pad := align512(int64(batch.Len())) - int64(batch.Len()); pad > 0 {
 		batch.Write(make([]byte, pad))
 	}
@@ -1044,6 +1331,9 @@ func (s *Store) storeLogsV2(logs []*raft.Log) error {
 	return nil
 }
 
+// commitBatch 在批次已持久化后推进内存视图: 逐条追加 logs/offsets, 按记录头的
+// 长度字段走完拼接缓冲(DeleteRange 需要按记录粒度的偏移), 按需预分配段并触发
+// sync_file_range 回写。调用方须持有 s.mu。
 // commitBatch advances the in-memory view after a durable batch write.
 // recordOffsets walks the concatenated buffer to keep per-record offsets
 // (needed by DeleteRange at record granularity).
@@ -1065,6 +1355,8 @@ func (s *Store) commitBatch(logs []*raft.Log, lsns []uint64, baseOff int64, buf 
 		recOff += recLen
 	}
 	s.endOff = baseOff + align512(recOff)
+	// 预分配与回写踢都是 best-effort: 失败被静默丢弃, 不影响本批的持久化
+	// (本批已由上面的 barrier 保证)。
 	if s.opts.PreallocateSegments {
 		_ = preallocate(s.f, s.endOff, s.opts.SegmentSize)
 	}
@@ -1073,6 +1365,8 @@ func (s *Store) commitBatch(logs []*raft.Log, lsns []uint64, baseOff int64, buf 
 	}
 }
 
+// storeLogsLegacy 是上游兼容路径: 每条记录 [u32][msgpack], 无 CRC 无填充; 可选
+// 走 io_uring 链, 否则逐条 Write 后一次 barrier。
 // storeLogsLegacy is the upstream-compatible path: [u32][msgpack] per record.
 func (s *Store) storeLogsLegacy(logs []*raft.Log) error {
 	encoded := make([][]byte, len(logs))
@@ -1131,9 +1425,12 @@ func (s *Store) storeLogsLegacy(logs []*raft.Log) error {
 	return nil
 }
 
+// barrier 是主(meta/unified)文件上的持久化屏障, 转发到 barrierOn(s.f)。
 // barrier is the durability barrier on the main (meta/unified) file.
 func (s *Store) barrier() error { return s.barrierOn(s.f) }
 
+// barrierOn 按 fd 施加持久化屏障, 三级降级: io_uring FSYNC → fdatasync → fsync;
+// 任一级成功即返回, 失败静默往下退(不报错)。
 // barrierOn: io_uring FSYNC → fdatasync → fsync, per fd.
 func (s *Store) barrierOn(f *os.File) error {
 	if s.opts.IORing {
@@ -1148,8 +1445,27 @@ func (s *Store) barrierOn(f *os.File) error {
 	return f.Sync()
 }
 
+// StoreLog 是单条追加的便捷包装, 直接转发到 StoreLogs(一次屏障)。
 func (s *Store) StoreLog(l *raft.Log) error { return s.StoreLogs([]*raft.Log{l}) }
 
+// GetLog 按 index 取日志写入 l。位置算术命中后仍交叉校验条目 index, 命中别的
+// 条目说明中间有洞 —— 绝不安静地把错误条目交出去。ref 模式下条目只存指针,
+// 内容从 redo.log 合并重建(复制与 FSM apply 都走这里)。
+// 算法解读：
+//
+//	原理：RLock 内做位置算术 off = index-first, 并用 logs[off].Index == index
+//	  交叉验证(洞检测)。ref 条目在同一个 RLock 临界区里抓拍 (base, segLSNs,
+//	  位置, fd), 随即持链移交 redoIoMu.RLock(无 TOCTOU, 压实换刀被排在外),
+//	  然后放掉 mu 在锁外读盘并合并。
+//	关键不变量：抓拍必须在同一临界区完成, 否则压实可能在中途换掉 fd; redo.log
+//	  append-only 且落位后不可变(去重重写 = 追加新版本 + 换 map 指针), 这是
+//	  "抓拍后可锁外读"的全部依据; 任何错误路径都必须放掉已持有的锁(mu 或
+//	  redoIoMu), 否则整进程死锁。
+//	代价与边界：命中洞时返回包着 ErrLogNotFound 的错误(调用方仍可用 errors.Is
+//	  判定); ref 条目一次 GetLog = 一次 redo.log ReadAt + 一次 Merge, 比 inline
+//	  条目贵。
+//	设计权衡：读锁分离是为了让 apply 路径的 mergeEntry 重建读不再与 StoreLogs
+//	  的 fsync/直发写在大锁里互挤(实测约 -20% 吞吐的税)。
 func (s *Store) GetLog(index uint64, l *raft.Log) error {
 	s.mu.RLock()
 	if s.first == 0 || index < s.first {
@@ -1193,34 +1509,168 @@ func (s *Store) GetLog(index uint64, l *raft.Log) error {
 	return nil
 }
 
+// FirstIndex 返回日志中最小(最旧)的 index, 空日志返回 0。持 RLock。
 func (s *Store) FirstIndex() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.first, nil
 }
 
+// entryDataForm 描述一条条目的 Data 在【比较时】处于什么形态 —— 决定重叠
+// 幂等校验能不能做字节比较。字节比较只在两端都是 inline 时才有意义:
+//   - ref 指针形态的字节在 redo.log(内存视图 Data=nil), 展开需要读盘与锁移交;
+//   - 省略标记形态(Extensions 带 elide marker)的 Data 被摘掉, 是"指针层"副本;
+//   - 空 Data 没有任何可比字节。
+//
+// 这几种形态拿 bytes.Equal 去比必然得出"内容不一致", 而误报的代价是
+// asyncWriteFailed 永久置坏 ⇒ leader step down(2026-10-24 40k DDL 档实证)。
+type entryDataForm uint8
+
+const (
+	// dataFormNoBytes: 该侧没有可比字节(空 Data / 已被压实 / 读取失败)。
+	dataFormNoBytes entryDataForm = iota
+	// dataFormRefPointer: ref 模式 redo 条目 —— Data 存 redo.log, 内存视图为 nil。
+	dataFormRefPointer
+	// dataFormElided: 指针层条目(Extensions 带 elide marker), Data 已省略。
+	dataFormElided
+	// dataFormInline: Data 就在本条记录里, 可与同为 inline 的一侧做内容比较。
+	dataFormInline
+)
+
+// String 供重叠冲突日志直出形态, 避免下次又把形态差异误读成 term 冲突。
+func (f entryDataForm) String() string {
+	switch f {
+	case dataFormInline:
+		return "inline"
+	case dataFormRefPointer:
+		return "ref-pointer"
+	case dataFormElided:
+		return "elided-pointer"
+	default:
+		return "no-bytes"
+	}
+}
+
 // peekLogMetaLocked 读回既有条目的【内存态】元数据(已持 s.mu, 读或写)。
 // 与 GetLog 的区别: 不做 ref 模式的 redo.log 合并(那会走 redoIoMu 移交,
-// 持写锁者不可用) —— ref 条目返回 Data=nil。供 StoreLogs 的幂等重写比对用。
-func (s *Store) peekLogMetaLocked(index uint64) (raft.Log, error) {
+// 持写锁者不可用) —— ref 条目返回 Data=nil 且形态为 dataFormRefPointer。
+// 供 StoreLogs 的幂等重写比对用。
+func (s *Store) peekLogMetaLocked(index uint64) (raft.Log, entryDataForm, error) {
 	if s.first == 0 || index < s.first {
-		return raft.Log{}, raft.ErrLogNotFound
+		return raft.Log{}, dataFormNoBytes, raft.ErrLogNotFound
 	}
 	off := index - s.first
 	if off >= uint64(len(s.logs)) {
-		return raft.Log{}, raft.ErrLogNotFound
+		return raft.Log{}, dataFormNoBytes, raft.ErrLogNotFound
 	}
 	if got := s.logs[off].Index; got != index {
-		return raft.Log{}, fmt.Errorf("filestore: hole detected: peekLogMeta(%d) maps to entry %d (first=%d len=%d): %w",
+		return raft.Log{}, dataFormNoBytes, fmt.Errorf("filestore: hole detected: peekLogMeta(%d) maps to entry %d (first=%d len=%d): %w",
 			index, got, s.first, len(s.logs), raft.ErrLogNotFound)
 	}
 	l := *s.logs[off]
 	if s.format == "v2-ref" && off < uint64(len(s.refSegs)) && len(s.refSegs[off]) > 0 {
 		l.Data = nil // ref 指针形态: 内容在 redo.log, 此处不展开
+		return l, dataFormRefPointer, nil
 	}
-	return l, nil
+	if len(l.Data) == 0 {
+		return l, dataFormNoBytes, nil
+	}
+	return l, dataFormInline, nil
 }
 
+// storedRedoSegsLocked 返回已落盘 ref 条目的段清单(base + LSN 序列)。
+// 段清单是【编码无关】的语义指纹: 同一逻辑命令无论写成 cmdBatch(count=1) 还是
+// 归一后的 cmdSingle, base 与 LSN 序列都相同, 而字节序列不一定相同; 反过来,
+// 内容不同的两条命令不可能给出相同的 base+LSN 序列(redo 流按 LSN 定位)。
+// 因此它让 ref 模式在不读盘、不做字节比较的前提下仍能识别真冲突。
+// 调用方须持 s.mu。
+func (s *Store) storedRedoSegsLocked(index uint64) (uint64, []uint64, bool) {
+	if s.format != "v2-ref" || s.first == 0 || index < s.first {
+		return 0, nil, false
+	}
+	off := index - s.first
+	if off >= uint64(len(s.logs)) || off >= uint64(len(s.refSegs)) || len(s.refSegs[off]) == 0 {
+		return 0, nil, false
+	}
+	var base uint64
+	if off < uint64(len(s.refBases)) {
+		base = s.refBases[off]
+	}
+	return base, s.refSegs[off], true
+}
+
+// equalRedoLSNs 比较两条段清单的 LSN 序列(顺序即拼接顺序, 必须逐位相等)。
+func equalRedoLSNs(stored []uint64, in []RedoSegment) bool {
+	if len(stored) != len(in) {
+		return false
+	}
+	for i := range stored {
+		if stored[i] != in[i].LSN {
+			return false
+		}
+	}
+	return true
+}
+
+// redoLSNsOf 抽出段清单里的 LSN 序列, 仅用于冲突日志。
+func redoLSNsOf(segs []RedoSegment) []uint64 {
+	if len(segs) == 0 {
+		return nil
+	}
+	out := make([]uint64, len(segs))
+	for i := range segs {
+		out[i] = segs[i].LSN
+	}
+	return out
+}
+
+// incomingDataFormLocked 判定【待写入条目】的 Data 形态是否可与已落盘条目
+// 逐字节比较。调用方须持 s.mu。
+//
+//	空 Data            ⇒ 无可比字节(可能是尚未展开的指针形态);
+//	Extensions 有省略标记 ⇒ 指针层副本, 字节不可比;
+//	v2-ref 且会被切成 redo 段 ⇒ 本次写入的字节落在 redo.log, 与内存视图不同源;
+//	其余               ⇒ inline, 可比较。
+func (s *Store) incomingDataFormLocked(l *raft.Log) entryDataForm {
+	if len(l.Data) == 0 {
+		return dataFormNoBytes
+	}
+	if raft.DecodeElideMarker(l.Extensions) != nil {
+		return dataFormElided
+	}
+	if s.format == "v2-ref" {
+		if _, segs := s.splitEntry(l); len(segs) > 0 {
+			return dataFormRefPointer
+		}
+	}
+	return dataFormInline
+}
+
+// canonicalEntryData 把 inline 字节归一成【语义形态】后再比较。
+//
+// codec 的编解码往返只承诺语义等价, 不承诺字节相等: 例如单段 cmdBatch(count=1)
+// 经 SplitSegments→MergeSegments 会归一成 cmdSingle(LogDB 的 logdbRedoCodec 注释
+// 明写"cmdBatch(count=1) 归一为 cmdSingle"), v2 文件重载时 decodeV2 也会走
+// Codec.Merge 重建 Data。于是【同一 index/term 的两条记录字节不同却完全合法】。
+// 直接 bytes.Equal 会把这种合法形态判成内容冲突 ⇒ 无谓 stepdown。
+// 归一化: 有 RedoSegmentCodec 且能切出 ≥1 段时, 用 MergeSegments 重建;
+// 切不出段(非 redo 命令行)则原字节即语义, 保持不变。
+func (s *Store) canonicalEntryData(data []byte) []byte {
+	if len(data) == 0 || s.opts.Codec == nil {
+		return data
+	}
+	sc, ok := s.opts.Codec.(RedoSegmentCodec)
+	if !ok {
+		return data
+	}
+	base, segs := sc.SplitSegments(data)
+	if len(segs) == 0 {
+		return data
+	}
+	return sc.MergeSegments(base, segs)
+}
+
+// LastIndex 返回日志中最大(最新)的 index, 空日志返回 0。持 RLock。
 func (s *Store) LastIndex() (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1324,6 +1774,22 @@ func (s *Store) DeleteRange(min, max uint64) error {
 
 // deleteRangeRewriteLocked 处理所有 min <= s.first 的删除: 把 [max,last] 外的
 // 幸存者记录原字节打包重写为新 meta 文件并原子 rename。调用方须持有 s.mu。
+// 算法解读：
+//
+//	原理：max >= last 走整段删除(截回起始偏移即可); 否则把幸存者 (max, last]
+//	  的记录【原字节】读出、拼进 bytes.Buffer(每满 1MiB flush 一次)、写进
+//	  path+".compact.tmp", Sync + Close 后 os.Rename 原子换名, 再 syncDir,
+//	  最后以 openDirectFlag(s.directIO) 重开并重算 offsets/first/endOff。
+//	关键不变量：rename 成功之前绝不关旧句柄(失败则旧文件仍是权威); v2 下头部
+//	  512B 原样抄过去(保留 flags), 每段 flush 都补零到 512 边界; 新 offsets
+//	  必须按"本段写入起点 + 缓冲内偏移"重算, 不能沿用旧偏移; lsnIndex 只删
+//	  index 落在 [min,max] 的键, 幸存者的绑定保留。
+//	代价与边界：O(幸存者字节) 的重写 + 一次全量 rename, 是最贵的一条路径 ——
+//	  所以只在 min <= first 的前缀删除(快照压实)时才走; 内存靠 1MiB 分段 flush
+//	  封顶; drop <= 0 或 drop >= len(logs) 直接 no-op。
+//	设计权衡：追加式文件无法原地挖洞, 而 raft 的压实又是常态操作, 于是选
+//	  "打包重写 + 原子 rename"而不是"墓碑 + 定期 GC" —— 代价是压实瞬间的写
+//	  放大, 换来读路径永远不必跳墓碑、文件永远紧凑。
 func (s *Store) deleteRangeRewriteLocked(min, max uint64) error {
 	last := s.lastIndexLocked()
 	if max >= last {
@@ -1433,6 +1899,8 @@ func (s *Store) deleteRangeRewriteLocked(min, max uint64) error {
 	if err := os.Rename(tmpPath, s.path); err != nil {
 		return err
 	}
+	// rename 之后必须 fsync 目录, 否则崩溃后新文件名可能尚未落地(旧文件已
+	// 被换名, 目录项丢失 = 整个日志消失)。syncDir 内部吞掉错误。
 	syncDir(dir)
 	newF, err := os.OpenFile(s.path, os.O_RDWR|openDirectFlag(s.directIO), 0o644)
 	if err != nil {
@@ -1464,6 +1932,8 @@ func (s *Store) deleteRangeRewriteLocked(min, max uint64) error {
 	return nil
 }
 
+// GetLogRaw 返回 index 对应的原始 Data 字节(12.8.2 raw-bytes 路径, 不经过
+// msgpack 解码); ref 模式与 GetLog 同走"抓拍 + 锁外读盘合并"两阶段。
 // GetLogRaw returns the raw Data bytes for index (12.8.2 raw-bytes path).
 func (s *Store) GetLogRaw(index uint64) ([]byte, error) {
 	s.mu.RLock()
@@ -1492,9 +1962,23 @@ func (s *Store) GetLogRaw(index uint64) ([]byte, error) {
 	return data, nil
 }
 
+// LookupByLSN 用稀疏索引把 redo LSN 解析成 raft index。索引在两种情况下建立:
+// unified/v1 + SparseIndex 开关, 或 ref 模式(无条件 —— 它就是读路径)。
 // LookupByLSN resolves a redo LSN to its raft index via the sparse index.
 // The index is populated when: unified/v1 + SparseIndex switch, or ref mode
 // (unconditionally — it is the read path).
+// 算法解读：
+//
+//	原理：map[lsn]lsnPos{index, off}, 绑定时刻 = 该 lsn 第一次被某条 raft meta
+//	  引用时(建 lsnIndex, 或 commitBatch 里填表)。绑定域即"raft 已提交可见的
+//	  LSN 集合", 与直发台账域(unboundPending)对照即可定位泄漏。
+//	关键不变量：lsn==0 表示"无 LSN"(codec 未拆出 envelope), 一律不入索引 ——
+//	  否则大量条目会挤在 0 这一个键上互相覆盖; 索引是【稀疏】的, 查不到 ≠ 数据
+//	  不在盘上(可能只是尚未被任何 meta 引用)。
+//	代价与边界：O(1) 查表, 内存 = O(已绑定条目数) 的 map 开销; 删日志时必须
+//	  同步清键(DeleteRange 两条路径都做了), 否则索引会随压实次数单调涨。
+//	设计权衡：用 map 而不是有序数组 + 二分, 因为 LSN 由业务分配、不保证单调,
+//	  二分要求有序会引入额外的排序维护成本。
 func (s *Store) LookupByLSN(lsn uint64) (uint64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1531,6 +2015,8 @@ type Stats struct {
 	RedoUnboundBytes int64  `json:"redoUnboundBytes,omitempty"` // P3 未绑定水位(当前值 gauge)
 }
 
+// unboundReserve 登记一条直发预留 (lsn, n 字节), 同时加台账与现金水位; n<=0
+// 直接 no-op。同 LSN 多代共存时各代各自挂账, 现金是全部代之和。
 // J5 泄漏修复(9.24): 未绑定水位的配对记账。生命周期按事件驱动:
 //
 //	① reserve(lsn, n): WriteRedoDirect 阶段1 每次"新代"预留登记(直发重写
@@ -1544,6 +2030,20 @@ type Stats struct {
 // 台账随进程存亡: reloadRef 从 redo 扫描重建(等价于把盘上未绑定记录重新
 // reserve); DeleteRange 清 lsnIndex 时一并清台账; CompactRedo 换 map 时
 // 同步清掉丢弃者的台账。
+// 算法解读：
+//
+//	原理：现金 unboundBytes 与台账 unboundPending[lsn] 恒等 —— reserve 加,
+//	  release/drain 减, Stats 只读现金。生命周期按事件驱动: ①reserve 挂账;
+//	  ②终点事件(绑定/重写替代/压实丢弃)整条清账; ③失败按本次预留量退还。
+//	关键不变量：现金恒 = Σ台账(破坏它 → 水位虚高单调涨满 UnboundRedoLimit →
+//	  直发通道永久背压); 台账随进程存亡(reloadRef 从 redo 扫描重建, DeleteRange
+//	  清 lsnIndex 时一并清台账, CompactRedo 换 map 时同步清); 现金扣减只在
+//	  "有台账"时发生 —— 这是防双扣的唯一闸门(K6 实测的 9443 次 bound=true
+//	  重写再投递就靠它吸收)。
+//	代价与边界：map 操作 O(1), 内存 = O(存活 LSN 数); 没有 TTL 也没有上限,
+//	  泄漏是单调累积的(K6 实测 60% 预留泄漏, 268MiB 钉死)。
+//	设计权衡：用 per-LSN 台账而不是只记总额, 是为了让"哪条 LSN 泄漏"可诊断
+//	  (DiagUnboundLsns/DiagUnboundAudit), 代价是每个 LSN 一份 map 条目。
 func (s *Store) unboundReserve(lsn uint64, n int64) {
 	if n <= 0 {
 		return
@@ -1594,6 +2094,8 @@ func (s *Store) unboundDrain(lsn uint64) {
 	}
 }
 
+// Stats 返回给 /storeinfo 一类端点用的观测快照: 格式、索引规模、首尾 index、
+// 文件偏移、io_uring/O_DIRECT 生效状态、空洞治愈计数与 J5 绑定速率计数器。
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1729,6 +2231,8 @@ func (s *Store) DiagSplitEntry(data []byte) (uint64, []uint64) {
 // ---------------------------------------------------------------------------
 // Ref-mode business read API (12.14.3): the redo view of the store.
 
+// LookupRedo 把 lsn 解析成 redo.log 里的 (offset, length), 命中与否由 ok 给出
+// —— 读的是内存 presence map, 不碰盘。持 RLock。
 // LookupRedo resolves an lsn to its redo.log offset/length (presence map).
 func (s *Store) LookupRedo(lsn uint64) (off int64, length int, ok bool) {
 	s.mu.RLock()
@@ -1737,6 +2241,8 @@ func (s *Store) LookupRedo(lsn uint64) (off int64, length int, ok bool) {
 	return pos.off, pos.length, ok
 }
 
+// ReadRedo 返回某个 lsn 的 redo 负载(未按 framer 解帧、未 Merge)。两阶段: RLock
+// 抓拍位置 + fd, 持链移交 redoIoMu.RLock 后锁外读盘; 读失败静默返回 false。
 // ReadRedo returns the redo payload for an lsn (unframed, pre-Merge).
 // 两阶段: mu.RLock 抓拍位置+fd, 持链移交 redoIoMu.RLock 后锁外读盘。
 func (s *Store) ReadRedo(lsn uint64) ([]byte, bool) {
@@ -1757,6 +2263,8 @@ func (s *Store) ReadRedo(lsn uint64) ([]byte, bool) {
 	return payload, true
 }
 
+// ReadRedoRaw 返回某个 lsn 的原始成帧记录字节(u32 长度前缀 + framer 体), 即
+// 业务读方要往下游发的形态; O_DIRECT 时走对齐缓冲读并裁回真实长度。
 // ReadRedoRaw returns the raw framed record bytes (u32 length prefix +
 // framer body) for an lsn — what a business reader ships downstream.
 func (s *Store) ReadRedoRaw(lsn uint64) ([]byte, bool) {
@@ -1788,6 +2296,7 @@ func (s *Store) ReadRedoRaw(lsn uint64) ([]byte, bool) {
 // ---------------------------------------------------------------------------
 // 12.9 helpers (best-effort, probed with fallback).
 
+// fdatasync 对 fd 做 Fdatasync(不刷 inode mtime); 失败静默回退到 fsync。
 func fdatasync(f *os.File) error {
 	if err := unix.Fdatasync(int(f.Fd())); err != nil {
 		return f.Sync()
@@ -1795,6 +2304,8 @@ func fdatasync(f *os.File) error {
 	return nil
 }
 
+// preallocate 用 fallocate 把下一个段(默认 64MiB)预分配到目标边界, 避免运行中
+// 才做块分配; off 已落在段起点则 no-op。
 func preallocate(f *os.File, off, segSize int64) error {
 	sz := segSize
 	if sz <= 0 {
@@ -1808,10 +2319,13 @@ func preallocate(f *os.File, off, segSize int64) error {
 	return unix.Fallocate(int(f.Fd()), 0, off, n)
 }
 
+// syncFileRange 发起异步回写(SYNC_FILE_RANGE_WRITE), 只把脏页推给块层, 不做
+// 屏障 —— 真正的持久化仍由 barrier 负责。
 func syncFileRange(f *os.File, off, n int64) error {
 	return unix.SyncFileRange(int(f.Fd()), off, n, unix.SYNC_FILE_RANGE_WRITE)
 }
 
+// fadviseDontNeed 提示内核 [off, off+n) 的页可以丢弃(截断尾巴后清 page cache)。
 func fadviseDontNeed(f *os.File, off, n int64) error {
 	return unix.Fadvise(int(f.Fd()), off, n, unix.FADV_DONTNEED)
 }

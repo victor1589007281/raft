@@ -84,6 +84,8 @@ type RedoFramer interface {
 // StdFramer is the default framing: [u64 base][u64 lsn][payload][u32 crc32c].
 type StdFramer struct{}
 
+// Frame 把一段 redo payload 按默认帧格式 [u64 base][u64 lsn][payload][u32 crc32c]
+// 编码成记录 body —— 磁盘上是 [u32 bodyLen][body], body 必须自定界。
 func (StdFramer) Frame(base, lsn uint64, payload []byte) []byte {
 	body := make([]byte, 16+len(payload)+4)
 	binary.LittleEndian.PutUint64(body[0:8], base)
@@ -93,11 +95,15 @@ func (StdFramer) Frame(base, lsn uint64, payload []byte) []byte {
 	return body
 }
 
+// Unframe 校验 CRC 后拆出 (base, lsn, payload); 长度不足或 CRC 不符一律报错。
+// 该错误在重载侧等价于「撕尾」: reloadRef 的 redo 扫描在此截断 good tail。
 func (StdFramer) Unframe(body []byte) (uint64, uint64, []byte, error) {
+	// 20 = 8(base) + 8(lsn) + 4(crc): 比这还短连帧头都放不下。
 	if len(body) < 20 {
 		return 0, 0, nil, errors.New("short redo record")
 	}
 	want := binary.LittleEndian.Uint32(body[len(body)-4:])
+	// CRC 覆盖除末尾 4B 校验和之外的整段; 不过即判撕尾(重载时在此截断)。
 	if crc32.Checksum(body[:len(body)-4], castagnoli) != want {
 		return 0, 0, nil, errors.New("redo crc mismatch")
 	}
@@ -119,6 +125,9 @@ type metaHead struct {
 	appendedAt int64  // unixnano; 0 = unset
 }
 
+// encodeMetaRecord 把一条 meta 头(可选 tail)编码为 [u32 recLen][64B head][tail]。
+// head 的 crc32c 只覆盖前 56B(56-60 是校验位、60-64 保留零); tail 自带
+// [u32 tailLen][msgpack][u32 crc]。msgpack 编码失败返回 nil(调用方按空记录处理)。
 func encodeMetaRecord(h metaHead, tail *logTail) []byte {
 	if tail != nil && len(tail.Data) == 0 && len(tail.Extensions) == 0 && len(tail.LSNs) == 0 {
 		tail = nil
@@ -150,6 +159,7 @@ func encodeMetaRecord(h metaHead, tail *logTail) []byte {
 	return body
 }
 
+// boolLen 在 b 为真时返回 n, 否则返回 0 —— 把「可选 tail 是否存在」折算成长度增量。
 func boolLen(b bool, n int) int {
 	if b {
 		return n
@@ -157,6 +167,9 @@ func boolLen(b bool, n int) int {
 	return 0
 }
 
+// decodeMetaRecord 解析一条 meta 记录 body(u32 recLen 之后的部分), 依次校验
+// head 与 tail 两级 CRC —— 任一级不过都返回错误, 由重载侧当作截断点。
+//
 // decodeMetaRecord parses one record body (bytes after the u32 recLen).
 func decodeMetaRecord(body []byte) (metaHead, *logTail, error) {
 	var h metaHead
@@ -199,6 +212,8 @@ func decodeMetaRecord(body []byte) (metaHead, *logTail, error) {
 // ---------------------------------------------------------------------------
 // Ref-mode store paths.
 
+// refEntrySegments 返回条目 i 的段 LSN 列表(内联条目或越界返回 nil)。
+//
 // refEntrySegments returns the segment LSN list of entry i (nil if inline).
 func (s *Store) refEntrySegments(i int) []uint64 {
 	if i >= len(s.refSegs) {
@@ -217,12 +232,38 @@ type segRef struct {
 	wrote  bool
 }
 
+// storeLogsRef 把一个批次落盘: redo 段追加进 redo.log, 定长 meta 记录追加进
+// raft.log, 两者在同一次 io_uring 事务(WRITE(redo)→WRITE(meta)→FSYNC→FSYNC)
+// 或经典回退路径(两次写 + 两次屏障)内一起变持久。调用方持 s.mu 写锁。
+//
 // storeLogsRef persists a batch as: redo segments appended to redo.log,
 // fixed meta records appended to raft.log, both durable in one io_uring
 // transaction (WRITE(redo)→WRITE(meta)→FSYNC→FSYNC) or the classic fallback
 // (write×2 + barrier×2). Segments already present in redoMap are not
 // rewritten (idempotent dedup; their durability came from the direct path's
 // own barrier).
+//
+// 算法解读：
+//
+//	原理：对每条日志先 splitEntry 切成 redo 段; 每段一条 redo.log 记录, meta 头
+//	只留指针(首段 LSN 在 head, 多段全表在 tail)。已在 redoMap 里的 LSN 走
+//	firstDiffAt 判定, 只有「确认要重写」才追加新记录; 两文件各自按 512 补齐批尾,
+//	再交给 io_uring 双 fd 链或经典路径落盘, 最后在内存里发布 logs/offsets/refSegs/
+//	redoMap/lsnIndex 与未绑定台账。
+//	关键不变量：① 单副本语义 —— 同一 LSN 的字节只应存在一份「当前代」, 判定表
+//	(相等/更长且前缀相容/更短且为前缀/真分叉)决定去重、更新、保留还是修复;
+//	② redo 先于 meta 持久(链里 FSYNC(redo) 排在 WRITE(meta) 前), 否则崩溃后会
+//	出现「meta 指向尚未落盘的 redo 字节」; ③ 内存索引只在两文件都 durable 之后
+//	才发布, 失败时 return 早于任何 append; ④ lsnIndex 在 ref 模式无条件建立
+//	(它本身就是读路径, 不受 SparseIndex 开关约束)。
+//	代价与边界：去重判定要对每个已存在段做一次 readRedoPayload(可能触发 O_DIRECT
+//	对齐读), 命中率高时省下写放大、命中率低时白读一次; 批尾 512 填充使每条批次
+//	至少占 512B, 小批次空间利用率低。
+//	设计权衡：用「读旧 + 比较 + 选择性重写」换「盲写造成同 LSN 双份字节」——
+//	redo.log 按位置寻址, 同 LSN 出现两份会让水位与压实语义失效; 但完全不比较
+//	又会丢掉「块渐满时同 start 段被更新快照覆盖」的正常演化。故取比较后按类别
+//	分派, 并把「未绑定重写」的账统一收口到 commit 循环的 unboundDrain(避免逐分支
+//	扣预留造成的泄漏)。
 func (s *Store) storeLogsRef(logs []*raft.Log) error {
 	framer := s.opts.Framer
 	if framer == nil {
@@ -342,6 +383,8 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 		metas[i] = &m
 	}
 	// Batch-tail padding: both files keep 512-aligned batch boundaries.
+	// redo 侧仅在非空时补齐(空批不该凭空占 512B); meta 侧恒补齐 —— 每次批次的
+	// 起止都必须落在 512 边界上, 否则下一条记录的 recLen 会读歪。
 	if pad := align512(int64(redoBuf.Len())) - int64(redoBuf.Len()); redoBuf.Len() > 0 && pad > 0 {
 		redoBuf.Write(make([]byte, pad))
 	}
@@ -349,6 +392,7 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 		metaBuf.Write(make([]byte, pad))
 	}
 	redoBytes, metaBytes := redoBuf.Bytes(), metaBuf.Bytes()
+	// O_DIRECT 还要求缓冲区**起始地址**对齐: 长度已由批尾填充保证, 这里补地址对齐。
 	if s.directIO {
 		redoBytes = alignedCopy(redoBytes)
 		metaBytes = alignedCopy(metaBytes)
@@ -363,6 +407,8 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 		}
 	}
 	if !durable {
+		// io_uring 不可用/失败时静默降级为经典 WriteAt + 屏障, 不重试也不报错;
+		// 实际用上了多少次由 s.ioringOK 计数暴露(探测证据)。
 		if len(redoBytes) > 0 {
 			if _, err := s.redoF.WriteAt(redoBytes, redoBaseOff); err != nil {
 				return err
@@ -432,6 +478,9 @@ func (s *Store) storeLogsRef(logs []*raft.Log) error {
 	return nil
 }
 
+// splitEntry 决定一条日志的 redo 段划分: 多段 codec(RedoSegmentCodec)优先,
+// 普通 codec 至多给 1 段(lsn==0 视为「非 redo 条目」), 无 codec 则无段。
+//
 // splitEntry decides an entry's redo segments: the multi-segment codec wins;
 // the plain codec yields ≤1 segment (lsn!=0); no codec = no segments.
 func (s *Store) splitEntry(l *raft.Log) (uint64, []RedoSegment) {
@@ -447,10 +496,31 @@ func (s *Store) splitEntry(l *raft.Log) (uint64, []RedoSegment) {
 	return 0, nil
 }
 
+// mergeEntry 按 segLSNs 从 redo.log 读回各段并交给 codec 合并, 重建一条 redo
+// 条目的 Data。调用方不持任何锁。
+//
 // mergeEntry rebuilds Data for a redo entry from its segments.
 // 两阶段读锁分离(12.14): 位置+fd 抓拍在 RLock 内, 盘读/合并全部锁外
 // (redo.log append-only 不可变; redoIoMu.RLock 钉住 fd 防压实换刀时
 // 被 close)。调用方不持任何锁。
+//
+// 算法解读：
+//
+//	原理：三段式 —— pinRefReadLocked 在 mu.RLock 内一次性抓拍 (fd, 各段 off/len)
+//	并完成到 redoIoMu.RLock 的持链移交; 随后全部 ReadAt + Unframe 在锁外做;
+//	最后按 codec 能力合并(多段走 RedoSegmentCodec.MergeSegments, 单段可退化为
+//	Codec.Merge 或直接返回裸 payload)。
+//	关键不变量：① 抓拍到的 (off,len) 在读取期间必须仍然有效 —— 依赖 redo.log
+//	append-only 与压实「只搬已发布记录且新文件逐字节等价」; ② fd 在整个读期间
+//	不能被 close, 由 redoIoMu.RLock 保证(压实换刀持 redoIoMu.Lock); ③ 合并顺序
+//	必须与写入顺序一致(segs 按 LSN 列表序), 否则业务信封错位。
+//	代价与边界：段数 N 时是 N 次随机读(每段可能一次 O_DIRECT 对齐读, 放大到
+//	512 边界); 段缺失/读失败直接向上抛, 由调用方(GetLog/ResolveElidedData)
+//	转成 ErrLogNotFound 或 RedoDataMissingError。
+//	设计权衡：把「抓拍」与「读盘」分成两段是为了不让慢 I/O 占住全局 mu —— 早期
+//	实现整段持 mu, 导致 redo 读延迟直接串住 StoreLogs。代价是引入 redoIoMu 与
+//	锁序约定(mu → redoIoMu), 以及「压实期间读者仍能继续读旧 fd」这一必须成立
+//	的前提。
 func (s *Store) mergeEntry(base uint64, segLSNs []uint64) ([]byte, error) {
 	s.mu.RLock()
 	f, poss, err := s.pinRefReadLocked(segLSNs)
@@ -483,6 +553,20 @@ func (s *Store) captureRefReadLocked(segLSNs []uint64) (*os.File, []redoPos, err
 // 不松手交接): 压实换刀需 mu.Lock+redoIoMu.Lock, 若先放 mu 再取 redoIoMu,
 // 压实在窗口内完成"换 fd+关旧 fd", 读者随后对已关闭 fd ReadAt(实测 EBADF)。
 // 失败路径自行放 mu 后返回。
+//
+// 算法解读：
+//
+//	原理：两把锁「不松手交接」—— 先在 mu.RLock 下取 redoIoMu.RLock(此时仍持 mu),
+//	拿到 redoIoMu 之后才放 mu, 把「抓拍位置」与「钉住 fd」两步做成原子的一次交接。
+//	关键不变量：整个函数返回时, 调用方持有的唯一锁是 redoIoMu.RLock, 而 fd 一定
+//	与抓拍时的 s.redoF 相同。两把锁缺一不可: 只有 mu 则盘读期间仍阻塞写路径;
+//	只有 redoIoMu 则抓拍 (off,len) 时可能与 StoreLogs/DeleteRange 竞态。若先放 mu
+//	再取 redoIoMu, 中间窗口里 CompactRedo 可以完成「换 fd + 关旧 fd」, 读者随后对
+//	已关闭的 fd ReadAt 会拿到 EBADF(实测捕获)。
+//	代价与边界：持链移交期间 mu 与 redoIoMu 短暂同时被持, 压实(需 mu.Lock +
+//	redoIoMu.Lock)会在这两个点之间阻塞 —— 但那是后台路径, 换来读路径不再占全局锁。
+//	设计权衡：为什么不用一把锁 + 引用计数 fd? 那样每次读都要改共享计数、且 fd 生命
+//	周期管理复杂; 用读写锁把「身份钉住」这件事显式化, 代价只是一条固定的锁序约定。
 func (s *Store) pinRefReadLocked(segLSNs []uint64) (*os.File, []redoPos, error) {
 	f, poss, err := s.captureRefReadLocked(segLSNs)
 	if err != nil {
@@ -517,6 +601,9 @@ func (s *Store) mergeCaptured(f *os.File, base uint64, segLSNs []uint64, poss []
 	return nil, fmt.Errorf("filestore: cannot merge %d segments without RedoSegmentCodec", len(segs))
 }
 
+// reloadRef 以 redo.log 为数据权威重建内存视图: 先扫 redo 建 lsn→pos 与 good
+// tail, 再扫 meta, 丢弃「引用到已被撕走字节」的 meta 记录(在该点截断)。
+//
 // reloadRef scans redo.log (data authority) then raft.log (meta), dropping
 // meta entries whose redo bytes were torn away.
 //
@@ -526,6 +613,26 @@ func (s *Store) mergeCaptured(f *os.File, base uint64, segLSNs []uint64, poss []
 // "redo 被撕走" → truncateAtGapLocked 级联截断 → 已提交条目不可达 →
 // commit=0 死锁。现洞后出现 CRC 合法记录则继续收集, 洞只是被跳过。
 // 未被任何 meta 引用的洞(孤零洞)由 CompactRedo 顺带收走。
+//
+// 算法解读：
+//
+//	原理：两趟扫描。第一趟用 scanRecords 解 redo 记录, 建 redoMap[lsn]→(off,len)
+//	并把 CRC 合法的记录延伸到 good tail(中间允许 512 对齐零洞, 洞只是被跳过);
+//	第二趟扫 meta, 对每条 redo 条目检查其全部段是否都落在 good tail 之内 ——
+//	任何一个越界就 errScanStop, 之后的 meta 全部丢弃。最后把两处 good tail 记为
+//	endOff/redoEnd, 再调 truncateAtGapLocked 处理**索引空洞**(在首个 index 不连续
+//	处截断 meta 并清掉其上的 lsnIndex), 并从 redoMap 反推未绑定台账。
+//	关键不变量：① redo.log 是权威 —— meta 说「有」不算数, 必须 redo 里真的有
+//	且完整; ② meta 侧仍是「一遇坏记录即截断」的前缀语义(不做洞后恢复), 而 redo
+//	侧允许 512 对齐零洞被跳过 —— 两侧容忍度刻意不对称, 见下方 #163 说明;
+//	③ lsnIndex 是「已绑定」的判据, 未进 lsnIndex 的 redoMap 项 = 直发残留, 必须
+//	重新挂账(unboundPending/unboundBytes), 否则水位记账跨重启失真。
+//	代价与边界：洞容忍让扫描不能「一遇零就停」, 需要识别「零洞后仍有合法 CRC
+//	记录」; 若洞后确实是垃圾, 仍在第一个坏记录处截断。台账不跨进程持久化, 靠
+//	本函数从 redoMap 重建(等价现金额), 因此重建的正确性直接决定背压是否误触发。
+//	设计权衡：旧实现「遇洞即停」会把洞后被引用的已提交 meta 全判为「redo 被撕走」
+//	并级联截断, 已提交条目不可达 → commit=0 死锁(#163)。故宁可容忍零洞、把
+//	「未绑定直发残留」的清理交给 CompactRedo, 也不在重载路径上做激进截断。
 func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	framer := s.opts.Framer
 	if framer == nil {
@@ -622,6 +729,8 @@ func (s *Store) reloadRef(rawMeta, rawRedo []byte) error {
 	return nil
 }
 
+// readRedoPayload 经 presence map(redoMap)读回某个 lsn 的 payload 字节。
+//
 // readRedoPayload returns the payload bytes for an lsn via the presence map.
 // 调用方必须持有 mu(写锁)—— 供 storeLogsRef/WriteRedoDirect 的去重判定用
 // (写锁本身已排除压实换刀, fd 稳定)。锁外读盘场景走 mergeCaptured/ReadRedo。
@@ -697,6 +806,24 @@ func fnv1a64(b []byte) uint64 {
 	return h
 }
 
+// firstDiffAt 返回 a、b 首个不同字节的偏移; 若一方是另一方的前缀则返回较短者
+// 的长度; 完全相等返回 -1。供 fencing / 快照更新判定与诊断日志使用。
+//
+// 算法解读：
+//
+//	原理：线性扫描到第一个不同字节即返回其下标; 扫完公共长度仍相同, 则用长度差
+//	区分「前缀关系」(返回较短长度)与「完全相等」(返回 -1)。
+//	关键不变量：返回值必须能同时表达三种情形 —— -1 = 逐字节相同; == len(较短者)
+//	= 一方是另一方的前缀; 其它 = 真正的内容分叉。调用方(storeLogsRef /
+//	WriteRedoDirect)正是按「diff == len(existing)」「diff < redoBlockHeaderLen」
+//	这两条判据把「块渐满扩展」「块头 data_len 推进」与「真分叉」分开的 —— 所以
+//	返回 -1 而不是 0 来代表「相同」是语义的一部分, 不能省。
+//	代价与边界：O(min(len)) 字节比较, 最坏情形(前缀相等但长度不同)才走满全程;
+//	对「同 LSN 但块头演化」的记录, 差异通常落在头 12B 内, 几乎立即返回。
+//	设计权衡：用「同 LSN 同前缀」而非哈希/全等来判断去重, 是因为 InnoDB log-writer
+//	对未满 512B 块会随数据渐满重写同 start 段, 块头 data_len 会推进 —— 逐字节全等
+//	会把这种正常演化误判成脑裂。故先给「差在哪儿」一个精确答案, 再由调用方按
+//	块头长度阈值分类, 而不是在这里直接下「相同/不同」的二元结论。
 func firstDiffAt(a, b []byte) int {
 	n := len(a)
 	if len(b) < n {
@@ -720,12 +847,39 @@ func firstDiffAt(a, b []byte) int {
 // 仅用于日志节流(见 CompactRedo), 不参与任何判定。
 var compactSkipCount uint64
 
+// CompactRedo 按检查点水位压实 redo.log: 把 lsn >= keepFromLSN 的存活记录重写
+// 进一个新文件再 rename 覆盖, 丢弃更老的记录。keepFromLSN 会被 clamp 到「仍被
+// 存活 meta 引用的最小 LSN」, 因此已提交且被引用的 redo 永不被丢。必须由业务
+// 检查点驱动(raft 快照先覆盖被丢区间)。全程持 s.mu 写锁。
+//
 // CompactRedo drops redo records with lsn < keepFromLSN by rewriting the
 // survivors to a fresh file and renaming it over redo.log. keepFrom is
 // clamped to the smallest lsn still referenced by live meta entries, so
 // committed-and-referenced redo is never dropped. Callers must drive this
 // from the business checkpoint (raft log snapshot must cover the dropped
 // range first).
+//
+// 算法解读：
+//
+//	原理：先按存活 meta 把所有段 LSN 取最小值 clamp 到 keepFromLSN; 若无任何
+//	记录可丢(keepFromLSN <= redoMap 最小 LSN)则**直接返回不重写**。否则把
+//	redoMap 的 LSN 排序, 逐条读旧文件、CRC 校验、按序写入 .tmp(每满 1MiB 落一次),
+//	Sync + Close + rename + syncDir 之后, 在 mu+redoIoMu 双锁下换刀: 换 redoF、
+//	换 redoMap、清掉被丢 LSN 的未绑定台账, 最后关旧 fd。
+//	关键不变量：① 被丢的 LSN 必须已不被任何存活 meta 引用(clamp 保证); ② 新文件
+//	内容与旧文件对幸存者逐字节等价, 故换刀期间仍持旧 fd 的读者读到的是同一份字节;
+//	③ 换刀必须在 redoIoMu.Lock 下做 —— 要等所有锁外读者的 in-flight ReadAt 收工
+//	才能关旧 fd; ④ 顺序固定为「写 .tmp → Sync → rename → 重新打开 → 换刀」, rename
+//	之前失败时 redo.log 完好无损。注意 rename 之后、换刀之前若 OpenFile 失败, 磁盘上
+//	已是新文件而 s.redoF 仍指向被替换掉的旧 inode —— 此处只返回错误, 不改变状态。
+//	代价与边界：重写体积 ∝ 存活记录总量, 与「能丢多少」无关 —— 这正是它退化成
+//	写放大器的边界: 当 raft 日志因快照滞后而长期不截断时, clamp 会让 keepFromLSN
+//	恒等于最小 LSN, 于是「无可丢」早退生效(实测曾每 ~20s 完整重写 832MiB 并全程
+//	持 mu, 把 StoreLogs 串到建表塌速 0.5 表/s, 见下方 #105 修复注释)。
+//	设计权衡：为什么不在 DeleteRange 里顺手回收 redo 空间? 因为 LSN 在 index 序上
+//	不单调(批提交会折叠不连续段), raft 冲突截断无法安全映射到 redo 区间; 故 redo
+//	回收只认业务检查点水位。为什么不做增量/后台回收? 那需要在写路径之外维护一份
+//	空洞账, 复杂度远高于收益 —— 在当前口径下「无可丢就不写」已消掉绝大部分开销。
 func (s *Store) CompactRedo(keepFromLSN uint64) error {
 	// ★#105 诊断(2026-09-25): 先**只测量**, 不改语义。
 	// 待证假设: 压实持 s.mu.Lock() 横跨「读旧→校验→写新→Sync→Rename→syncDir」全过程
@@ -797,6 +951,7 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 		framer = StdFramer{}
 	}
 	dir := filepath.Dir(s.path)
+	// 固定的 .tmp 名: 压实全程持 s.mu, 同一 store 上不会有两个压实抢同一个 tmp。
 	tmpPath := filepath.Join(dir, redoFileName+".tmp")
 	nf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -845,6 +1000,7 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 		}
 		newMap[lsn] = redoPos{off: writeOff + int64(batch.Len()), length: pos.length}
 		batch.Write(raw)
+		// 1MiB 攒批: 太小则 write syscall 次数多, 太大则一次向 .tmp 吐出过多脏页。
 		if batch.Len() >= 1<<20 {
 			if err := flush(); err != nil {
 				nf.Close()
@@ -856,6 +1012,7 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 		nf.Close()
 		return err
 	}
+	// 必须先 Sync 新文件再 rename: 否则掉电后可能 rename 出一个内容不全的 redo.log。
 	if err := nf.Sync(); err != nil {
 		nf.Close()
 		return err
@@ -896,6 +1053,9 @@ func (s *Store) CompactRedo(keepFromLSN uint64) error {
 	return nil
 }
 
+// syncDir 对目录本身做一次 fsync —— rename 的持久化依赖目录项落盘, 只 Sync 文件
+// 数据不够(文件在, 但「新名字指向它」这件事可能还在页缓存里)。
+// 打开或同步失败一律静默忽略: 这是尽力而为的加固, 不是正确性依赖。
 func syncDir(dir string) {
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
@@ -903,6 +1063,9 @@ func syncDir(dir string) {
 	}
 }
 
+// sortU64 就地把 uint64 切片按升序插入排序。压实重写前用它把 redoMap 的 LSN
+// 排成有序, 使新文件里的记录按 LSN 单调(便于扫描与定位)。
+// 注意是 O(n²): 只用在压实路径, 不在写/读热路径上。
 func sortU64(a []uint64) {
 	for i := 1; i < len(a); i++ {
 		for j := i; j > 0 && a[j] < a[j-1]; j-- {
@@ -914,6 +1077,9 @@ func sortU64(a []uint64) {
 // ---------------------------------------------------------------------------
 // Alignment helpers (O_DIRECT tier).
 
+// alignedCopy 返回 b 的一份 512 对齐副本(O_DIRECT 写用)。长度与偏移此前已由
+// 批尾填充对齐, 这里只补「缓冲区起始地址」这一项对齐要求。
+//
 // alignedCopy returns a 512-aligned copy of b (for O_DIRECT writes; lengths
 // and offsets are already aligned by batch-tail padding).
 func alignedCopy(b []byte) []byte {
@@ -925,6 +1091,9 @@ func alignedCopy(b []byte) []byte {
 	return buf
 }
 
+// alignedBytes 分配一块「起始地址 512 对齐、长度恰为 n」的字节切片。
+// 做法: 多要 511B, 再把首地址向上取整到 512, 返回原切片的子切片 —— 代价是
+// 这块底层数组比 n 略大, 且子切片会让整个底层数组一直存活(不可 GC 前半段)。
 func alignedBytes(n int) []byte {
 	raw := make([]byte, n+511)
 	base := uintptr(unsafe.Pointer(unsafe.SliceData(raw)))
@@ -932,12 +1101,33 @@ func alignedBytes(n int) []byte {
 	return raw[pad : pad+n]
 }
 
+// readAtAligned 在 O_DIRECT fd 上服务任意 (off,len) 读: 把区间向外扩到 512 边界
+// 再读, 最后裁回调用方要的窗口。
+//
 // readAtAligned services an arbitrary (off,len) read from an O_DIRECT fd.
+//
+// 算法解读：
+//
+//	原理：O_DIRECT 要求偏移、长度、缓冲区地址三者都按块(512)对齐, 所以不能直接
+//	读 [off, off+n)。做法是 lo = off 向下取整到 512, hi = off+n 向上取整到 512,
+//	分配一块地址也对齐的 hi-lo 字节缓冲, 一次 ReadAt(buf, lo), 再切片裁回
+//	buf[off-lo : off-lo+n] 返回给调用方 —— 扩读进来的前导/尾随字节对调用方不可见。
+//	关键不变量：① 三个对齐要求必须同时满足(只对齐长度或只对齐偏移都会被内核
+//	EINVAL 拒掉); ② 返回切片与原缓冲区共享底层数组, 生命周期绑定, 调用方不得
+//	假设它是独立副本; ③ 「短读」才是失败 —— 读到的字节数不足 off-lo+n 时返回
+//	io.ErrUnexpectedEOF, 而 io.EOF 本身不算错(恰好读到文件尾是合法的)。
+//	代价与边界：单次读最多放大到 1KiB 额外字节(前导 <512 + 尾随 <512); 若 off 或
+//	n 未按 512 对齐(redo 记录本身就是这样, 记录之间没有 512 填充), 扩读就是常态
+//	而非例外。文件被并发截断时可能在扩读区拿不到数据, 表现为 ErrUnexpectedEOF。
+//	设计权衡：为什么不在写入时就把每条记录都补到 512 从而让读取天然对齐? 那会让
+//	redo.log 体积膨胀数倍(redo 段往往只有几十到几百字节), 空间代价远大于读放大。
+//	故选择「写紧凑 + 读时扩窗」。
 func readAtAligned(f *os.File, off int64, n int) ([]byte, error) {
-	lo := off &^ 511
-	hi := align512(off + int64(n))
+	lo := off &^ 511               // 向下取整到 512 边界(O_DIRECT 的偏移约束)
+	hi := align512(off + int64(n)) // 向上取整, 保证覆盖 [off, off+n) 全部字节
 	buf := alignedBytes(int(hi - lo))
 	got, err := f.ReadAt(buf, lo)
+	// io.EOF 不算错: 只有「读到的字节数不足」才是真问题(见下方长度检查)。
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -947,6 +1137,8 @@ func readAtAligned(f *os.File, off int64, n int) ([]byte, error) {
 	return buf[off-lo : off-lo+int64(n)], nil
 }
 
+// openDirectFlag 在 on 时返回 unix.O_DIRECT, 否则返回 0(即不附加任何打开标志)。
+// 供 os.OpenFile 的 flag 位或运算使用。
 func openDirectFlag(on bool) int {
 	if on {
 		return unix.O_DIRECT
@@ -954,4 +1146,6 @@ func openDirectFlag(on bool) int {
 	return 0
 }
 
+// timeFromUnixNano 把 unixnano 时间戳还原成 time.Time, 与 meta 头的 appendedAt
+// 字段配套(写入侧用 UnixNano, 0 表示「未设置」故调用方会先判零)。
 func timeFromUnixNano(ns int64) time.Time { return time.Unix(0, ns) }

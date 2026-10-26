@@ -396,3 +396,114 @@ func TestIORingChainIfAvailable(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 记录级形状标志(recFlagRedo/recFlagShapeKnown)回归。
+
+// shapeTestCodec: 0xE1 开头的 Data 视为 redo 信封(拆 base/lsn/payload),
+// 其余字节是控制命令原文 —— 复刻 LogDB logdbRedoCodec 的形状语义。
+type shapeTestCodec struct{}
+
+const shapeRedoTag = 0xE1
+
+func (shapeTestCodec) SplitShape(data []byte) (uint64, uint64, []byte, bool) {
+	if len(data) >= 17 && data[0] == shapeRedoTag {
+		return binary.BigEndian.Uint64(data[1:9]), binary.BigEndian.Uint64(data[9:17]), data[17:], true
+	}
+	return 0, 0, data, false
+}
+
+func (c shapeTestCodec) Split(l *raft.Log) (uint64, uint64, []byte) {
+	base, lsn, payload, _ := c.SplitShape(l.Data)
+	return base, lsn, payload
+}
+
+func (shapeTestCodec) Merge(base, lsn uint64, payload []byte) []byte {
+	out := make([]byte, 17, 17+len(payload))
+	out[0] = shapeRedoTag
+	binary.BigEndian.PutUint64(out[1:9], base)
+	binary.BigEndian.PutUint64(out[9:17], lsn)
+	return append(out, payload...)
+}
+
+// legacyShapeCodec 只实现 RedoCodec(不含 SplitShape)⇒ 等价于修复前的旧写者:
+// encodeV2 写 flags=0, 重载恒走 Merge。
+type legacyShapeCodec struct{}
+
+func (legacyShapeCodec) Split(l *raft.Log) (uint64, uint64, []byte) {
+	return shapeTestCodec{}.Split(l)
+}
+
+func (legacyShapeCodec) Merge(base, lsn uint64, payload []byte) []byte {
+	return shapeTestCodec{}.Merge(base, lsn, payload)
+}
+
+// TestV2RecordShapeFlagRoundtrip: 控制命令(0 段)重载必须原样返回, redo 段
+// (含 lsn=0)仍经 Merge 重建; 旧 flags=0 记录保持旧语义, 且可与新记录混存。
+func TestV2RecordShapeFlagRoundtrip(t *testing.T) {
+	if _, ok := any(legacyShapeCodec{}).(RedoShapeCodec); ok {
+		t.Fatal("legacyShapeCodec must not implement RedoShapeCodec")
+	}
+	dir := filepath.Join(t.TempDir(), "logs")
+	redoZero := &raft.Log{Index: 1, Term: 2, Type: raft.LogCommand,
+		Data: shapeTestCodec{}.Merge(0, 0, []byte("redo-lsn0"))}
+	redo := &raft.Log{Index: 2, Term: 2, Type: raft.LogCommand,
+		Data: shapeTestCodec{}.Merge(7, 8, []byte("redo"))}
+	control := &raft.Log{Index: 3, Term: 2, Type: raft.LogCommand,
+		Data: []byte{0x7F, 1, 2, 3, 4}}
+
+	s, err := Open(dir, Options{SingleWAL: true, Codec: shapeTestCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreLogs([]*raft.Log{redoZero, redo, control}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(dir, Options{SingleWAL: true, Codec: shapeTestCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []*raft.Log{redoZero, redo, control} {
+		var got raft.Log
+		if err := s2.GetLog(want.Index, &got); err != nil {
+			t.Fatalf("GetLog(%d): %v", want.Index, err)
+		}
+		if string(got.Data) != string(want.Data) {
+			t.Fatalf("index %d roundtrip mismatch: got %x want %x", want.Index, got.Data, want.Data)
+		}
+	}
+	s2.Close()
+
+	// 旧写者(flags=0): redo 仍正确, 控制命令保持旧(恒 Merge)语义。
+	dir2 := filepath.Join(t.TempDir(), "logs")
+	s3, err := Open(dir2, Options{SingleWAL: true, Codec: legacyShapeCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s3.StoreLogs([]*raft.Log{redo, control}); err != nil {
+		t.Fatal(err)
+	}
+	s3.Close()
+	s4, err := Open(dir2, Options{SingleWAL: true, Codec: shapeTestCodec{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s4.Close()
+	var gotRedo raft.Log
+	if err := s4.GetLog(2, &gotRedo); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotRedo.Data) != string(redo.Data) {
+		t.Fatalf("old-file redo mismatch: got %x want %x", gotRedo.Data, redo.Data)
+	}
+	var gotCtl raft.Log
+	if err := s4.GetLog(3, &gotCtl); err != nil {
+		t.Fatal(err)
+	}
+	if want := (shapeTestCodec{}).Merge(0, 0, control.Data); string(gotCtl.Data) != string(want) {
+		t.Fatalf("old-file control must keep legacy semantics: got %x want %x", gotCtl.Data, want)
+	}
+}

@@ -134,6 +134,11 @@ const (
 	SnapshotVersionMax = 1
 )
 
+// Config 汇总 Raft 服务器的全部配置: 上游的超时/快照/日志/日志器字段, 外加 vraft
+// 新增的 12.6 组提交、12.7 单 WAL、12.8 RPC 传输、12.9 内核 I/O、12.14 P3/P4 指针
+// 复制开关。所有 vraft 开关都默认关闭(见 DefaultConfig), 遵循"默认关 + 显式开启 +
+// 探测回退"的项目约定: 关掉时行为与上游一致, 打开后失败也只会退化而不是出错。
+//
 // Config provides any necessary configuration for the Raft server.
 type Config struct {
 	// ProtocolVersion allows a Raft server to inter-operate with older
@@ -285,6 +290,12 @@ type Config struct {
 	// step down as leader.
 	LeaderLeaseTimeout time.Duration
 
+	// CampaignDelay 在 follower 判定 leader 失联、准备转为 candidate 之前调用。
+	// 返回值是额外等待时间(仅延迟, 不禁止当选); 用于让 redo 前沿更新的节点先竞选。
+	// nil = 不延迟。实现方需保证有界(例如 <=2s), 避免影响可用性。
+	// 库内另有 2s 硬上限, 且每个失联周期至多应用一次 —— 到期后必定照常进入选举。
+	CampaignDelay func() time.Duration
+
 	// LocalID is a unique ID for this server across all time. When running with
 	// ProtocolVersion < 3, you must set this to be the same as the network
 	// address of your transport.
@@ -338,6 +349,9 @@ type Config struct {
 	skipStartup bool
 }
 
+// getOrCreateLogger 返回配置里的 Logger; 未提供时按 LogOutput/LogLevel 现造一个,
+// 并把 LogOutput 缺省补成 os.Stderr。注意它会写回接收者(conf.LogOutput), 即这次
+// 调用有副作用; LogLevel 认不出的字符串会被 hclog 解析成 NoLevel。
 func (conf *Config) getOrCreateLogger() hclog.Logger {
 	if conf.Logger != nil {
 		return conf.Logger
@@ -353,6 +367,9 @@ func (conf *Config) getOrCreateLogger() hclog.Logger {
 	})
 }
 
+// RPCTCPConfig 汇总 12.8 的 TCP 调优旋钮。字段全部是指针, 用来区分"没配置"与
+// "显式配成零/false": 未配置时留 nil, 由传输层按探测结果回退到内核默认。
+//
 // RPCTCPConfig groups 12.8 TCP tuning knobs (all optional, probed).
 type RPCTCPConfig struct {
 	TCPNoDelay  *bool `json:"tcp_no_delay,omitempty"`
@@ -362,6 +379,8 @@ type RPCTCPConfig struct {
 	BBR         *bool `json:"bbr,omitempty"`
 }
 
+// ReloadableConfig 是 Config 中允许运行时经 raft.ReloadConfig 热更的那个子集。
+//
 // ReloadableConfig is the subset of Config that may be reconfigured during
 // runtime using raft.ReloadConfig. We choose to duplicate fields over embedding
 // or accepting a Config but only using specific fields to keep the API clear.
@@ -410,6 +429,10 @@ type ReloadableConfig struct {
 	UseFadvise          *bool `json:"use_fadvise,omitempty"`
 }
 
+// apply 把 ReloadableConfig 里的值写到传入的 Config 上并返回副本(不改入参)。
+// 上游的 5 个热更字段无条件覆盖; vraft 新增的 BatchWindow / MaxAppendEntries
+// 只在非零时应用, 3 个磁盘开关只在指针非 nil 时应用。
+//
 // apply sets the reloadable fields on the passed Config to the values in
 // `ReloadableConfig`. It returns a copy of Config with the fields from this
 // ReloadableConfig set.
@@ -419,6 +442,24 @@ type ReloadableConfig struct {
 // loop (12.6) does not set them, and must keep its current batching behavior
 // rather than silently receive a validation failure from a zeroed
 // MaxAppendEntries.
+//
+// 算法解读：
+//
+//	原理：三类字段三种判据 —— 无条件覆盖(TrailingLogs/SnapshotInterval/
+//	      SnapshotThreshold/HeartbeatTimeout/ElectionTimeout)、`> 0` 判定
+//	      (BatchWindow/MaxAppendEntries)、`!= nil` 判定(UseFdatasync/
+//	      PreallocateSegments/UseFadvise)。
+//	关键不变量：**零值不等于"要设成零"**。12.6 之前就存在的调用方构造
+//	      ReloadableConfig 时不会填 BatchWindow/MaxAppendEntries, 它们保持 Go
+//	      零值; 若照搬覆盖, MaxAppendEntries 会被打成 0, 而 ValidateConfig 要求
+//	      它必须为正 —— 一次热更就会把节点打成启动失败; BatchWindow 被清零则
+//	      会静默关掉组提交窗口, 改变批处理行为。指针字段天然区分"没给"与
+//	      "给了 false", 所以磁盘开关用指针而不是布尔。
+//	代价与边界：O(1) 的字段拷贝。代价是**无法用本接口把 BatchWindow /
+//	      MaxAppendEntries 显式改回 0** —— 想关掉组提交窗口只能改 Config 重启。
+//	设计权衡：把"未设置"的区分压在调用方(非零 / 指针)而不是给 ReloadableConfig
+//	      加一层显式的 set 标记, 是为了不改它的对外结构 —— 它是公开 API, 加字段
+//	      会影响所有既有调用方。
 func (rc *ReloadableConfig) apply(to Config) Config {
 	to.TrailingLogs = rc.TrailingLogs
 	to.SnapshotInterval = rc.SnapshotInterval
@@ -443,6 +484,10 @@ func (rc *ReloadableConfig) apply(to Config) Config {
 	return to
 }
 
+// fromConfig 把 Config 里的可热更字段拷进 ReloadableConfig, 是 apply 的逆操作。
+// 三个磁盘开关在这里一律取地址成非 nil(即"显式给值"), 与 Config 里的布尔字段
+// 一一对应, 因此 fromConfig 的结果再 apply 回去是恒等变换。
+//
 // fromConfig copies the reloadable fields from the passed Config.
 func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.TrailingLogs = from.TrailingLogs
@@ -460,8 +505,20 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 	rc.UseFadvise = &v3
 }
 
+// DefaultConfig 返回一份带可用默认值的 Config。
+// 这些数值全部沿用上游 hashicorp/raft 的默认(不是 vraft 调优的结果), 各字段的
+// 来历见下面旁注; vraft 新增的 12.6/12.7/12.8/12.9/12.14 开关一个都不在这里打开,
+// 保持"默认关 + 显式开启 + 探测回退"的约定。
+//
 // DefaultConfig returns a Config with usable defaults.
 func DefaultConfig() *Config {
+	// 各默认值的来历: 1s 的心跳与选举超时取同值, 靠选举超时的随机抖动把各节点
+	// 错开(而不是靠两者之间的固定差值); CommitTimeout 50ms 让空载的 leader 也定期
+	// 发心跳式 AppendEntries 推进 commitIndex; MaxAppendEntries 64 是单批上限,
+	// 硬上限 1024 由 ValidateConfig 把关; TrailingLogs 10240 让落后不多的 follower
+	// 走日志追赶而非整份快照; SnapshotInterval 120s 实际在 [120s,240s] 间随机;
+	// SnapshotThreshold 8192 是"值得付一次快照"的门槛; LeaderLeaseTimeout 500ms
+	// 必须 <= HeartbeatTimeout(见 ValidateConfig)。
 	return &Config{
 		ProtocolVersion:    ProtocolVersionMax,
 		HeartbeatTimeout:   1000 * time.Millisecond,
@@ -477,10 +534,19 @@ func DefaultConfig() *Config {
 	}
 }
 
+// ValidateConfig 校验配置的自洽性, 返回第一条不满足的约束对应的错误。
+//
+// 除了逐字段的范围检查, 这里还有几条**跨字段**约束, 单看某个字段是看不出来的:
+// LeaderLeaseTimeout 必须 <= HeartbeatTimeout; ElectionTimeout 必须 >=
+// HeartbeatTimeout; SingleWALSparseIndex 依赖 SingleWALEnabled; IORingSQPoll 依赖
+// IORingEnabled; RPCProtocolLevel 取值域是 0..4。
+//
 // ValidateConfig is used to validate a sane configuration
 func ValidateConfig(config *Config) error {
 	// We don't actually support running as 0 in the library any more, but
 	// we do understand it.
+	// protocolMin 是编译期常量判定, 恒为真: 本意是"库已不再支持以协议版本 0
+	// 运行, 但仍能读懂它", 所以有效下界是 1 而 ProtocolVersionMin 仍是 0。
 	protocolMin := ProtocolVersionMin
 	if protocolMin == 0 {
 		protocolMin = 1
@@ -505,6 +571,8 @@ func ValidateConfig(config *Config) error {
 	if config.MaxAppendEntries <= 0 {
 		return fmt.Errorf("MaxAppendEntries must be positive")
 	}
+	// 1024 是经验上限: 再大, 单次 AppendEntries 的编码/传输/落盘会变成尖峰,
+	// 组提交攒批换来的吞吐会被单批尾延迟吃掉。
 	if config.MaxAppendEntries > 1024 {
 		return fmt.Errorf("MaxAppendEntries is too large")
 	}
@@ -520,6 +588,9 @@ func ValidateConfig(config *Config) error {
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
 	}
+	// vraft 的依赖关系: 稀疏索引与 io_uring SQPOLL 都只是上层开关, 底下的总闸
+	// (SingleWALEnabled / IORingEnabled)没开时它们无从生效 —— 这里选择直接报错
+	// 而不是静默忽略, 免得配置写错了没人发现。
 	if config.SingleWALSparseIndex && !config.SingleWALEnabled {
 		return fmt.Errorf("SingleWALSparseIndex requires SingleWALEnabled")
 	}
